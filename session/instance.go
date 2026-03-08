@@ -347,6 +347,11 @@ func (i *Instance) Attach() (chan struct{}, error) {
 	return i.tmuxSession.Attach()
 }
 
+// SetNoWorktree overrides the no-worktree flag. Call before Start().
+func (i *Instance) SetNoWorktree(v bool) {
+	i.noWorktree = v
+}
+
 func (i *Instance) SetPreviewSize(width, height int) error {
 	if !i.started || i.Status == Paused {
 		return fmt.Errorf("cannot set preview size for instance that has not been started or " +

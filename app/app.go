@@ -369,6 +369,12 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 				return m, m.handleError(fmt.Errorf("title cannot be empty"))
 			}
 
+			// "claude" is a reserved name for a no-worktree instance that runs
+			// claude directly in the project directory (no branch isolation).
+			if instance.Title == "claude" {
+				instance.SetNoWorktree(true)
+			}
+
 			// Set loading status for visual feedback (spinner in the list).
 			instance.SetStatus(session.Loading)
 
