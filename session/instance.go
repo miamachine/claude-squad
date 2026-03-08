@@ -355,10 +355,14 @@ func (i *Instance) SetPreviewSize(width, height int) error {
 	return i.tmuxSession.SetDetachedSize(width, height)
 }
 
-// GetGitWorktree returns the git worktree for the instance
+// GetGitWorktree returns the git worktree for the instance.
+// Returns an error if the instance has not been started or is in no-worktree mode.
 func (i *Instance) GetGitWorktree() (*git.GitWorktree, error) {
 	if !i.started {
 		return nil, fmt.Errorf("cannot get git worktree for instance that has not been started")
+	}
+	if i.noWorktree || i.gitWorktree == nil {
+		return nil, fmt.Errorf("instance '%s' has no git worktree (running in no-worktree mode)", i.Title)
 	}
 	return i.gitWorktree, nil
 }
