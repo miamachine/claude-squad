@@ -141,7 +141,12 @@ func FromInstanceData(data InstanceData) (*Instance, error) {
 		instance.tmuxSession = tmux.NewTmuxSession(instance.Title, instance.Program)
 	} else {
 		if err := instance.Start(false); err != nil {
-			return nil, err
+			// tmux session is gone (e.g. machine rebooted, tmux killed).
+			// auto-pause so CS starts clean rather than erroring.
+			log.WarningLog.Printf("session '%s' not found, marking paused: %v", instance.Title, err)
+			instance.started = true
+			instance.Status = Paused
+			instance.tmuxSession = tmux.NewTmuxSession(instance.Title, instance.Program)
 		}
 	}
 
