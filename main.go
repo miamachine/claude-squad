@@ -22,6 +22,7 @@ var (
 	programFlag string
 	autoYesFlag bool
 	daemonFlag  bool
+	repoFlag    string
 	rootCmd     = &cobra.Command{
 		Use:   "claude-squad",
 		Short: "Claude Squad - Manage multiple AI agents like Claude Code, Aider, Codex, and Amp.",
@@ -37,14 +38,11 @@ var (
 				return err
 			}
 
-			// Check if we're in a git repository
-			currentDir, err := filepath.Abs(".")
+			// Determine the default repo path for new instances.
+			// Priority: --repo flag > git root of cwd > cwd (no-worktree mode).
+			repoPath, err := resolveRepoPath(repoFlag)
 			if err != nil {
-				return fmt.Errorf("failed to get current directory: %w", err)
-			}
-
-			if !git.IsGitRepo(currentDir) {
-				return fmt.Errorf("error: claude-squad must be run from within a git repository")
+				return err
 			}
 
 			cfg := config.LoadConfig()
@@ -71,7 +69,7 @@ var (
 				log.ErrorLog.Printf("failed to stop daemon: %v", err)
 			}
 
-			return app.Run(ctx, program, autoYes)
+			return app.Run(ctx, program, autoYes, repoPath)
 		},
 	}
 
@@ -143,9 +141,31 @@ var (
 	}
 )
 
+// resolveRepoPath determines the default repo path for new instances.
+// If repoFlag is set, it validates and returns that. Otherwise it tries the
+// git root of cwd. If cwd is not a git repo, it returns cwd and callers
+// should set NoWorktree on new instances.
+func resolveRepoPath(repoFlag string) (string, error) {
+	if repoFlag != "" {
+		abs, err := filepath.Abs(repoFlag)
+		if err != nil {
+			return "", fmt.Errorf("invalid --repo path: %w", err)
+		}
+		return abs, nil
+	}
+
+	cwd, err := filepath.Abs(".")
+	if err != nil {
+		return "", fmt.Errorf("failed to get current directory: %w", err)
+	}
+	return cwd, nil
+}
+
 func init() {
 	rootCmd.Flags().StringVarP(&programFlag, "program", "p", "",
 		"Program to run in new instances (e.g. 'aider --model ollama_chat/gemma3:1b')")
+	rootCmd.Flags().StringVarP(&repoFlag, "repo", "r", "",
+		"Default repo path for new instances (defaults to cwd; no-worktree mode if not a git repo)")
 	rootCmd.Flags().BoolVarP(&autoYesFlag, "autoyes", "y", false,
 		"[experimental] If enabled, all instances will automatically accept prompts")
 	rootCmd.Flags().BoolVar(&daemonFlag, "daemon", false, "Run a program that loads all sessions"+

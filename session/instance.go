@@ -55,6 +55,9 @@ type Instance struct {
 	// DiffStats stores the current git diff statistics
 	diffStats *git.DiffStats
 
+	// noWorktree is true when this instance runs directly in Path without a git worktree.
+	noWorktree bool
+
 	// The below fields are initialized upon calling Start().
 
 	started bool
@@ -67,16 +70,17 @@ type Instance struct {
 // ToInstanceData converts an Instance to its serializable form
 func (i *Instance) ToInstanceData() InstanceData {
 	data := InstanceData{
-		Title:     i.Title,
-		Path:      i.Path,
-		Branch:    i.Branch,
-		Status:    i.Status,
-		Height:    i.Height,
-		Width:     i.Width,
-		CreatedAt: i.CreatedAt,
-		UpdatedAt: time.Now(),
-		Program:   i.Program,
-		AutoYes:   i.AutoYes,
+		Title:      i.Title,
+		Path:       i.Path,
+		Branch:     i.Branch,
+		Status:     i.Status,
+		Height:     i.Height,
+		Width:      i.Width,
+		CreatedAt:  i.CreatedAt,
+		UpdatedAt:  time.Now(),
+		Program:    i.Program,
+		AutoYes:    i.AutoYes,
+		NoWorktree: i.noWorktree,
 	}
 
 	// Only include worktree data if gitWorktree is initialized
@@ -105,27 +109,31 @@ func (i *Instance) ToInstanceData() InstanceData {
 // FromInstanceData creates a new Instance from serialized data
 func FromInstanceData(data InstanceData) (*Instance, error) {
 	instance := &Instance{
-		Title:     data.Title,
-		Path:      data.Path,
-		Branch:    data.Branch,
-		Status:    data.Status,
-		Height:    data.Height,
-		Width:     data.Width,
-		CreatedAt: data.CreatedAt,
-		UpdatedAt: data.UpdatedAt,
-		Program:   data.Program,
-		gitWorktree: git.NewGitWorktreeFromStorage(
-			data.Worktree.RepoPath,
-			data.Worktree.WorktreePath,
-			data.Worktree.SessionName,
-			data.Worktree.BranchName,
-			data.Worktree.BaseCommitSHA,
-		),
+		Title:      data.Title,
+		Path:       data.Path,
+		Branch:     data.Branch,
+		Status:     data.Status,
+		Height:     data.Height,
+		Width:      data.Width,
+		CreatedAt:  data.CreatedAt,
+		UpdatedAt:  data.UpdatedAt,
+		Program:    data.Program,
+		noWorktree: data.NoWorktree,
 		diffStats: &git.DiffStats{
 			Added:   data.DiffStats.Added,
 			Removed: data.DiffStats.Removed,
 			Content: data.DiffStats.Content,
 		},
+	}
+
+	if !data.NoWorktree {
+		instance.gitWorktree = git.NewGitWorktreeFromStorage(
+			data.Worktree.RepoPath,
+			data.Worktree.WorktreePath,
+			data.Worktree.SessionName,
+			data.Worktree.BranchName,
+			data.Worktree.BaseCommitSHA,
+		)
 	}
 
 	if instance.Paused() {
@@ -150,6 +158,10 @@ type InstanceOptions struct {
 	Program string
 	// If AutoYes is true, then
 	AutoYes bool
+	// NoWorktree skips git worktree creation and runs claude directly in Path.
+	// Use this for repos where you want to work on the main branch, or for
+	// directories that are not git repositories.
+	NoWorktree bool
 }
 
 func NewInstance(opts InstanceOptions) (*Instance, error) {
@@ -162,21 +174,25 @@ func NewInstance(opts InstanceOptions) (*Instance, error) {
 	}
 
 	return &Instance{
-		Title:     opts.Title,
-		Status:    Ready,
-		Path:      absPath,
-		Program:   opts.Program,
-		Height:    0,
-		Width:     0,
-		CreatedAt: t,
-		UpdatedAt: t,
-		AutoYes:   false,
+		Title:      opts.Title,
+		Status:     Ready,
+		Path:       absPath,
+		Program:    opts.Program,
+		Height:     0,
+		Width:      0,
+		CreatedAt:  t,
+		UpdatedAt:  t,
+		AutoYes:    false,
+		noWorktree: opts.NoWorktree,
 	}, nil
 }
 
 func (i *Instance) RepoName() (string, error) {
 	if !i.started {
 		return "", fmt.Errorf("cannot get repo name for instance that has not been started")
+	}
+	if i.gitWorktree == nil {
+		return filepath.Base(i.Path), nil
 	}
 	return i.gitWorktree.GetRepoName(), nil
 }
@@ -201,7 +217,7 @@ func (i *Instance) Start(firstTimeSetup bool) error {
 	}
 	i.tmuxSession = tmuxSession
 
-	if firstTimeSetup {
+	if firstTimeSetup && !i.noWorktree {
 		gitWorktree, branchName, err := git.NewGitWorktree(i.Path, i.Title)
 		if err != nil {
 			return fmt.Errorf("failed to create git worktree: %w", err)
@@ -226,6 +242,12 @@ func (i *Instance) Start(firstTimeSetup bool) error {
 		// Reuse existing session
 		if err := tmuxSession.Restore(); err != nil {
 			setupErr = fmt.Errorf("failed to restore existing session: %w", err)
+			return setupErr
+		}
+	} else if i.noWorktree {
+		// No worktree — start claude directly in Path
+		if err := i.tmuxSession.Start(i.Path); err != nil {
+			setupErr = fmt.Errorf("failed to start new session: %w", err)
 			return setupErr
 		}
 	} else {
@@ -375,6 +397,18 @@ func (i *Instance) Pause() error {
 
 	var errs []error
 
+	if i.noWorktree {
+		// No worktree — just detach the tmux session and mark as paused.
+		if err := i.tmuxSession.DetachSafely(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to detach tmux session: %w", err))
+		}
+		if err := i.combineErrors(errs); err != nil {
+			return err
+		}
+		i.SetStatus(Paused)
+		return nil
+	}
+
 	// Check if there are any changes to commit
 	if dirty, err := i.gitWorktree.IsDirty(); err != nil {
 		errs = append(errs, fmt.Errorf("failed to check if worktree is dirty: %w", err))
@@ -431,6 +465,23 @@ func (i *Instance) Resume() error {
 	}
 	if i.Status != Paused {
 		return fmt.Errorf("can only resume paused instances")
+	}
+
+	if i.noWorktree {
+		// No worktree — just restart the tmux session in Path.
+		if i.tmuxSession.DoesSessionExist() {
+			if err := i.tmuxSession.Restore(); err != nil {
+				if err := i.tmuxSession.Start(i.Path); err != nil {
+					return fmt.Errorf("failed to resume session: %w", err)
+				}
+			}
+		} else {
+			if err := i.tmuxSession.Start(i.Path); err != nil {
+				return fmt.Errorf("failed to resume session: %w", err)
+			}
+		}
+		i.SetStatus(Running)
+		return nil
 	}
 
 	// Check if branch is checked out
@@ -509,7 +560,7 @@ func (i *Instance) UpdateDiffStats() error {
 // ComputeDiff runs the expensive git diff I/O and returns the result without
 // mutating instance state. Safe to call from a background goroutine.
 func (i *Instance) ComputeDiff() *git.DiffStats {
-	if !i.started || i.Status == Paused {
+	if !i.started || i.Status == Paused || i.noWorktree || i.gitWorktree == nil {
 		return nil
 	}
 	return i.gitWorktree.Diff()
