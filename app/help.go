@@ -42,7 +42,7 @@ func (h helpTypeGeneral) toContent() string {
 		headerStyle.Render("Managing:"),
 		keyStyle.Render("n")+descStyle.Render("         - Create a new session"),
 		keyStyle.Render("N")+descStyle.Render("         - Create a new session with a prompt"),
-		keyStyle.Render("a")+descStyle.Render("         - Attach (existing worktree or no worktree)"),
+		keyStyle.Render("a")+descStyle.Render("         - Create instance (new worktree, existing, or none)"),
 		keyStyle.Render("D")+descStyle.Render("         - Kill (delete) the selected session"),
 		keyStyle.Render("↑/j, ↓/k")+descStyle.Render("  - Navigate between sessions"),
 		keyStyle.Render("↵/o")+descStyle.Render("       - Attach to the selected session"),

@@ -46,8 +46,10 @@ const (
 	stateHelp
 	// stateConfirm is the state when a confirmation modal is displayed.
 	stateConfirm
-	// stateAttach is the state when the user is choosing an attach mode.
-	stateAttach
+	// stateAttachMenu is the state when the user is choosing an attach mode.
+	stateAttachMenu
+	// stateAttachList is the state when the user is picking from a list of existing worktrees.
+	stateAttachList
 	// stateAttachPath is the state when the user is entering a worktree path.
 	stateAttachPath
 )
@@ -99,6 +101,8 @@ type home struct {
 	textOverlay *overlay.TextOverlay
 	// confirmationOverlay displays confirmation modals
 	confirmationOverlay *overlay.ConfirmationOverlay
+	// selectionOverlay displays a scrollable list picker
+	selectionOverlay *overlay.SelectionOverlay
 
 	// -- Attach mode fields --
 
@@ -312,7 +316,7 @@ func (m *home) handleMenuHighlighting(msg tea.KeyMsg) (cmd tea.Cmd, returnEarly 
 		return nil, false
 	}
 	if m.state == statePrompt || m.state == stateHelp || m.state == stateConfirm ||
-		m.state == stateAttach || m.state == stateAttachPath {
+		m.state == stateAttachMenu || m.state == stateAttachList || m.state == stateAttachPath {
 		return nil, false
 	}
 	// If it's in the global keymap, we should try to highlight it.
@@ -459,14 +463,66 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		return m, nil
 	}
 
-	// Handle attach mode selection state
-	if m.state == stateAttach {
+	// Handle attach menu state (3-option picker: w/e/n)
+	if m.state == stateAttachMenu {
 		switch msg.String() {
+		case "w":
+			// New worktree — same flow as KeyNew
+			cwd, _ := os.Getwd()
+			if !git.IsGitRepo(cwd) {
+				m.state = stateDefault
+				return m, m.handleError(fmt.Errorf("not in a git repository — use 'n' for no worktree"))
+			}
+			if m.list.NumInstances() >= GlobalInstanceLimit {
+				m.state = stateDefault
+				return m, m.handleError(fmt.Errorf("you can't create more than %d instances", GlobalInstanceLimit))
+			}
+			instance, err := session.NewInstance(session.InstanceOptions{
+				Title:   "",
+				Path:    ".",
+				Program: m.program,
+			})
+			if err != nil {
+				m.state = stateDefault
+				return m, m.handleError(err)
+			}
+			m.newInstanceFinalizer = m.list.AddInstance(instance)
+			m.list.SetSelectedInstance(m.list.NumInstances() - 1)
+			m.state = stateNew
+			m.menu.SetState(ui.StateNewInstance)
+			return m, nil
 		case "e":
-			// Existing worktree mode → enter path
-			m.attachMode = session.WorktreeExisting
-			m.attachPath = ""
-			m.state = stateAttachPath
+			// Existing worktree — show worktree picker list
+			cwd, _ := os.Getwd()
+			if !git.IsGitRepo(cwd) {
+				m.state = stateDefault
+				return m, m.handleError(fmt.Errorf("not in a git repository — use 'n' for no worktree"))
+			}
+			worktrees, err := git.ListWorktrees(cwd)
+			if err != nil {
+				m.state = stateDefault
+				return m, m.handleError(fmt.Errorf("failed to list worktrees: %w", err))
+			}
+			if len(worktrees) == 0 {
+				m.state = stateDefault
+				return m, m.handleError(fmt.Errorf("no linked worktrees found — use 'w' to create a new one"))
+			}
+			// Build selection items
+			items := make([]overlay.SelectionItem, len(worktrees))
+			for i, wt := range worktrees {
+				items[i] = overlay.SelectionItem{
+					Label:       wt.Branch,
+					Description: wt.Path,
+					Value:       wt.Path,
+				}
+			}
+			m.selectionOverlay = overlay.NewSelectionOverlay(
+				"Select Existing Worktree",
+				items,
+				"↑/↓ navigate • enter select • p type path • esc cancel",
+			)
+			m.selectionOverlay.SetWidth(55)
+			m.state = stateAttachList
 			return m, nil
 		case "n":
 			// No worktree mode → create instance, enter title
@@ -492,6 +548,81 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 			return m, nil
 		case "esc", "ctrl+c":
 			m.state = stateDefault
+			return m, nil
+		}
+		return m, nil
+	}
+
+	// Handle worktree list selection state
+	if m.state == stateAttachList {
+		// "p" falls back to manual path entry
+		if msg.String() == "p" {
+			m.attachMode = session.WorktreeExisting
+			m.attachPath = ""
+			m.selectionOverlay = nil
+			m.state = stateAttachPath
+			return m, nil
+		}
+
+		shouldClose := m.selectionOverlay.HandleKeyPress(msg)
+		if shouldClose {
+			if m.selectionOverlay.Selected {
+				item := m.selectionOverlay.GetSelectedItem()
+				if item == nil {
+					m.state = stateDefault
+					m.selectionOverlay = nil
+					return m, nil
+				}
+				worktreePath := item.Value
+
+				// Duplicate detection: check if any running instance already uses this path
+				for _, inst := range m.list.GetInstances() {
+					if inst.Path == worktreePath {
+						m.state = stateDefault
+						m.selectionOverlay = nil
+						return m, m.handleError(fmt.Errorf("worktree already managed by instance '%s'", inst.Title))
+					}
+				}
+
+				if m.list.NumInstances() >= GlobalInstanceLimit {
+					m.state = stateDefault
+					m.selectionOverlay = nil
+					return m, m.handleError(fmt.Errorf("you can't create more than %d instances", GlobalInstanceLimit))
+				}
+
+				instance, err := session.NewInstance(session.InstanceOptions{
+					Title:                "",
+					Path:                 ".",
+					Program:              m.program,
+					WorktreeMode:         session.WorktreeExisting,
+					ExistingWorktreePath: worktreePath,
+				})
+				if err != nil {
+					m.state = stateDefault
+					m.selectionOverlay = nil
+					return m, m.handleError(err)
+				}
+
+				// Pre-fill title from branch name, stripping the branch prefix
+				branchName := item.Label
+				cfg := config.LoadConfig()
+				if strings.HasPrefix(branchName, cfg.BranchPrefix) {
+					branchName = strings.TrimPrefix(branchName, cfg.BranchPrefix)
+				}
+				if err := instance.SetTitle(branchName); err != nil {
+					log.ErrorLog.Printf("failed to pre-fill title: %v", err)
+				}
+
+				m.newInstanceFinalizer = m.list.AddInstance(instance)
+				m.list.SetSelectedInstance(m.list.NumInstances() - 1)
+				m.selectionOverlay = nil
+				m.state = stateNew
+				m.menu.SetState(ui.StateNewInstance)
+				return m, nil
+			}
+			// Cancelled
+			m.state = stateDefault
+			m.selectionOverlay = nil
 			return m, nil
 		}
 		return m, nil
@@ -588,14 +719,11 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 
 	switch name {
 	case keys.KeyAttach:
-		if m.instanceStarting {
-			return m, m.handleError(fmt.Errorf("please wait for the current session to finish starting"))
-		}
 		if m.list.NumInstances() >= GlobalInstanceLimit {
 			return m, m.handleError(
 				fmt.Errorf("you can't create more than %d instances", GlobalInstanceLimit))
 		}
-		m.state = stateAttach
+		m.state = stateAttachMenu
 		return m, nil
 	case keys.KeyHelp:
 		return m.showHelpScreen(helpTypeGeneral{}, nil)
@@ -955,9 +1083,14 @@ func (m *home) View() string {
 			log.ErrorLog.Printf("confirmation overlay is nil")
 		}
 		return overlay.PlaceOverlay(0, 0, m.confirmationOverlay.Render(), mainView, true, true)
-	} else if m.state == stateAttach {
-		attachOverlay := m.renderAttachOverlay()
+	} else if m.state == stateAttachMenu {
+		attachOverlay := m.renderAttachMenuOverlay()
 		return overlay.PlaceOverlay(0, 0, attachOverlay, mainView, true, true)
+	} else if m.state == stateAttachList {
+		if m.selectionOverlay == nil {
+			log.ErrorLog.Printf("selection overlay is nil")
+		}
+		return overlay.PlaceOverlay(0, 0, m.selectionOverlay.Render(), mainView, true, true)
 	} else if m.state == stateAttachPath {
 		pathOverlay := m.renderAttachPathOverlay()
 		return overlay.PlaceOverlay(0, 0, pathOverlay, mainView, true, true)
@@ -966,22 +1099,29 @@ func (m *home) View() string {
 	return mainView
 }
 
-// renderAttachOverlay renders the attach mode selector overlay.
-func (m *home) renderAttachOverlay() string {
+// renderAttachMenuOverlay renders the attach mode selector overlay.
+func (m *home) renderAttachMenuOverlay() string {
 	style := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("62")).
 		Padding(1, 2).
-		Width(50)
+		Width(55)
 
 	highlightKey := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFCC00"))
+	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#777777"))
+
+	// Show the configured branch prefix so users know the naming convention.
+	cfg := config.LoadConfig()
+	branchHint := fmt.Sprintf("(branch: %s{name})", cfg.BranchPrefix)
+
 	content := lipgloss.JoinVertical(lipgloss.Left,
-		lipgloss.NewStyle().Bold(true).Underline(true).Foreground(lipgloss.Color("#7D56F4")).Render("Attach Mode"),
+		lipgloss.NewStyle().Bold(true).Underline(true).Foreground(lipgloss.Color("#7D56F4")).Render("Create New Instance"),
 		"",
-		highlightKey.Render("e")+" - Existing worktree (enter path)",
-		highlightKey.Render("n")+" - No worktree (run in current dir)",
+		highlightKey.Render("w")+"   New worktree "+dimStyle.Render(branchHint),
+		highlightKey.Render("e")+"   Existing worktree (pick from list)",
+		highlightKey.Render("n")+"   No worktree (run in current directory)",
 		"",
-		lipgloss.NewStyle().Foreground(lipgloss.Color("#777777")).Render("esc to cancel"),
+		dimStyle.Render("esc to cancel"),
 	)
 	return style.Render(content)
 }

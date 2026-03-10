@@ -1,8 +1,10 @@
 package ui
 
 import (
+	"claude-squad/config"
 	"claude-squad/log"
 	"claude-squad/session"
+	"claude-squad/session/git"
 	"errors"
 	"fmt"
 	"strings"
@@ -185,10 +187,17 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, h
 	remainingWidth -= diffWidth
 
 	branch := i.Branch
+	// Preview the branch name during title entry for un-started WorktreeNew instances.
+	if branch == "" && i.WorktreeMode == session.WorktreeNew && i.Title != "" {
+		cfg := config.LoadConfig()
+		branch = cfg.BranchPrefix + git.SanitizeBranchName(i.Title)
+	}
 	if i.WorktreeMode == session.WorktreeNone {
 		branch = "(no worktree)"
 	} else if i.WorktreeMode == session.WorktreeExisting {
-		branch += " [ext]"
+		if branch != "" {
+			branch += " [ext]"
+		}
 	}
 	if i.Started() && hasMultipleRepos {
 		repoName, err := i.RepoName()

@@ -7,10 +7,10 @@ import (
 	"strings"
 )
 
-// sanitizeBranchName transforms an arbitrary string into a Git branch name friendly string.
+// SanitizeBranchName transforms an arbitrary string into a Git branch name friendly string.
 // Note: Git branch names have several rules, so this function uses a simple approach
 // by allowing only a safe subset of characters.
-func sanitizeBranchName(s string) string {
+func SanitizeBranchName(s string) string {
 	// Convert to lower-case
 	s = strings.ToLower(s)
 

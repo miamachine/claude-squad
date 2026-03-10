@@ -130,6 +130,56 @@ func (g *GitWorktree) Prune() error {
 	return nil
 }
 
+// WorktreeInfo describes a single linked worktree.
+type WorktreeInfo struct {
+	// Path is the absolute path to the worktree directory.
+	Path string
+	// Branch is the branch name (without refs/heads/ prefix).
+	Branch string
+}
+
+// ListWorktrees returns all linked worktrees for the repository at repoPath,
+// excluding the main worktree (which is always the first entry in porcelain output).
+func ListWorktrees(repoPath string) ([]WorktreeInfo, error) {
+	cmd := exec.Command("git", "-C", repoPath, "worktree", "list", "--porcelain")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list worktrees: %w", err)
+	}
+
+	var result []WorktreeInfo
+	var current *WorktreeInfo
+	isFirst := true
+
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		if strings.HasPrefix(line, "worktree ") {
+			// Finish the previous entry (if any and not the first/main worktree).
+			if current != nil {
+				result = append(result, *current)
+			}
+			if isFirst {
+				// Skip the main worktree; start tracking from the second entry.
+				isFirst = false
+				current = nil
+				continue
+			}
+			current = &WorktreeInfo{
+				Path: strings.TrimPrefix(line, "worktree "),
+			}
+		} else if strings.HasPrefix(line, "branch ") && current != nil {
+			branchPath := strings.TrimPrefix(line, "branch ")
+			current.Branch = strings.TrimPrefix(branchPath, "refs/heads/")
+		}
+	}
+	// Don't forget the last entry.
+	if current != nil {
+		result = append(result, *current)
+	}
+
+	return result, nil
+}
+
 // CleanupWorktrees removes all worktrees and their associated branches
 func CleanupWorktrees() error {
 	worktreesDir, err := getWorktreeDirectory()
