@@ -4,7 +4,9 @@ import (
 	"claude-squad/config"
 	"claude-squad/log"
 	"fmt"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -102,4 +104,75 @@ func (g *GitWorktree) GetRepoName() string {
 // GetBaseCommitSHA returns the base commit SHA for the worktree
 func (g *GitWorktree) GetBaseCommitSHA() string {
 	return g.baseCommitSHA
+}
+
+// runGitCommandStatic runs a git command at the given path without needing a GitWorktree receiver.
+// This is used during construction of GitWorktree from an existing worktree.
+func runGitCommandStatic(path string, args ...string) (string, error) {
+	baseArgs := []string{"-C", path}
+	cmd := exec.Command("git", append(baseArgs, args...)...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("git command failed: %s (%w)", output, err)
+	}
+	return string(output), nil
+}
+
+// NewGitWorktreeFromExisting wraps an already-existing worktree directory.
+// It auto-detects the branch and main repo path from the worktree.
+func NewGitWorktreeFromExisting(worktreePath string) (*GitWorktree, string, error) {
+	absPath, err := filepath.Abs(worktreePath)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to get absolute path: %w", err)
+	}
+
+	// Detect current branch
+	branchOutput, err := runGitCommandStatic(absPath, "branch", "--show-current")
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to detect branch at %s: %w", absPath, err)
+	}
+	branchName := strings.TrimSpace(branchOutput)
+	if branchName == "" {
+		return nil, "", fmt.Errorf("worktree at %s is in detached HEAD state; a branch is required", absPath)
+	}
+
+	// Detect main repo path via git rev-parse --git-common-dir
+	commonDirOutput, err := runGitCommandStatic(absPath, "rev-parse", "--git-common-dir")
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to detect main repo from %s: %w", absPath, err)
+	}
+	commonDir := strings.TrimSpace(commonDirOutput)
+	// The common dir is the .git directory of the main repo. Resolve to the repo root.
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Join(absPath, commonDir)
+	}
+	repoPath := filepath.Dir(commonDir)
+	// Clean the path to resolve any ".." components
+	repoPath = filepath.Clean(repoPath)
+
+	// Get base commit SHA (HEAD of the worktree)
+	headOutput, err := runGitCommandStatic(absPath, "rev-parse", "HEAD")
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to get HEAD at %s: %w", absPath, err)
+	}
+	baseCommitSHA := strings.TrimSpace(headOutput)
+
+	return &GitWorktree{
+		repoPath:      repoPath,
+		worktreePath:  absPath,
+		sessionName:   branchName,
+		branchName:    branchName,
+		baseCommitSHA: baseCommitSHA,
+	}, branchName, nil
+}
+
+// IsWorktree checks whether the given path is a git worktree (as opposed to the main repo).
+func IsWorktree(path string) bool {
+	output, err := runGitCommandStatic(path, "rev-parse", "--git-dir")
+	if err != nil {
+		return false
+	}
+	gitDir := strings.TrimSpace(output)
+	// A worktree's --git-dir points to a subdirectory under the main repo's .git/worktrees/
+	return strings.Contains(gitDir, "worktrees")
 }

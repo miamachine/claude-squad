@@ -24,6 +24,7 @@ const (
 	KeyResume
 	KeyPrompt // New key for entering a prompt
 	KeyHelp   // Key for showing help screen
+	KeyAttach // Key for attaching to an existing worktree or running without one
 
 	// Diff keybindings
 	KeyShiftUp
@@ -42,6 +43,7 @@ var GlobalKeyStringsMap = map[string]KeyName{
 	"enter":      KeyEnter,
 	"o":          KeyEnter,
 	"n":          KeyNew,
+	"a":          KeyAttach,
 	"D":          KeyKill,
 	"q":          KeyQuit,
 	"tab":        KeyTab,
@@ -108,6 +110,10 @@ var GlobalkeyBindings = map[KeyName]key.Binding{
 	KeyResume: key.NewBinding(
 		key.WithKeys("r"),
 		key.WithHelp("r", "resume"),
+	),
+	KeyAttach: key.NewBinding(
+		key.WithKeys("a"),
+		key.WithHelp("a", "attach"),
 	),
 
 	// -- Special keybindings --

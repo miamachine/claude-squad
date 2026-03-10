@@ -46,6 +46,10 @@ const (
 	stateHelp
 	// stateConfirm is the state when a confirmation modal is displayed.
 	stateConfirm
+	// stateAttach is the state when the user is choosing an attach mode.
+	stateAttach
+	// stateAttachPath is the state when the user is entering a worktree path.
+	stateAttachPath
 )
 
 type home struct {
@@ -95,6 +99,13 @@ type home struct {
 	textOverlay *overlay.TextOverlay
 	// confirmationOverlay displays confirmation modals
 	confirmationOverlay *overlay.ConfirmationOverlay
+
+	// -- Attach mode fields --
+
+	// attachMode is the worktree mode selected during attach flow.
+	attachMode session.WorktreeMode
+	// attachPath is the worktree path being entered during stateAttachPath.
+	attachPath string
 }
 
 func newHome(ctx context.Context, program string, autoYes bool) *home {
@@ -300,7 +311,8 @@ func (m *home) handleMenuHighlighting(msg tea.KeyMsg) (cmd tea.Cmd, returnEarly 
 		m.keySent = false
 		return nil, false
 	}
-	if m.state == statePrompt || m.state == stateHelp || m.state == stateConfirm {
+	if m.state == statePrompt || m.state == stateHelp || m.state == stateConfirm ||
+		m.state == stateAttach || m.state == stateAttachPath {
 		return nil, false
 	}
 	// If it's in the global keymap, we should try to highlight it.
@@ -447,6 +459,91 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		return m, nil
 	}
 
+	// Handle attach mode selection state
+	if m.state == stateAttach {
+		switch msg.String() {
+		case "e":
+			// Existing worktree mode → enter path
+			m.attachMode = session.WorktreeExisting
+			m.attachPath = ""
+			m.state = stateAttachPath
+			return m, nil
+		case "n":
+			// No worktree mode → create instance, enter title
+			m.attachMode = session.WorktreeNone
+			if m.list.NumInstances() >= GlobalInstanceLimit {
+				m.state = stateDefault
+				return m, m.handleError(fmt.Errorf("you can't create more than %d instances", GlobalInstanceLimit))
+			}
+			instance, err := session.NewInstance(session.InstanceOptions{
+				Title:        "",
+				Path:         ".",
+				Program:      m.program,
+				WorktreeMode: session.WorktreeNone,
+			})
+			if err != nil {
+				m.state = stateDefault
+				return m, m.handleError(err)
+			}
+			m.newInstanceFinalizer = m.list.AddInstance(instance)
+			m.list.SetSelectedInstance(m.list.NumInstances() - 1)
+			m.state = stateNew
+			m.menu.SetState(ui.StateNewInstance)
+			return m, nil
+		case "esc", "ctrl+c":
+			m.state = stateDefault
+			return m, nil
+		}
+		return m, nil
+	}
+
+	// Handle attach path entry state
+	if m.state == stateAttachPath {
+		switch msg.Type {
+		case tea.KeyEnter:
+			if m.attachPath == "" {
+				return m, m.handleError(fmt.Errorf("path cannot be empty"))
+			}
+			// Validate the path is a git worktree or at least a git repo
+			if !git.IsGitRepo(m.attachPath) {
+				return m, m.handleError(fmt.Errorf("path is not a git repository: %s", m.attachPath))
+			}
+			if m.list.NumInstances() >= GlobalInstanceLimit {
+				m.state = stateDefault
+				return m, m.handleError(fmt.Errorf("you can't create more than %d instances", GlobalInstanceLimit))
+			}
+			instance, err := session.NewInstance(session.InstanceOptions{
+				Title:                "",
+				Path:                 ".",
+				Program:              m.program,
+				WorktreeMode:         session.WorktreeExisting,
+				ExistingWorktreePath: m.attachPath,
+			})
+			if err != nil {
+				m.state = stateDefault
+				return m, m.handleError(err)
+			}
+			m.newInstanceFinalizer = m.list.AddInstance(instance)
+			m.list.SetSelectedInstance(m.list.NumInstances() - 1)
+			m.state = stateNew
+			m.menu.SetState(ui.StateNewInstance)
+			return m, nil
+		case tea.KeyRunes:
+			m.attachPath += string(msg.Runes)
+		case tea.KeyBackspace:
+			runes := []rune(m.attachPath)
+			if len(runes) > 0 {
+				m.attachPath = string(runes[:len(runes)-1])
+			}
+		case tea.KeySpace:
+			m.attachPath += " "
+		case tea.KeyEsc:
+			m.state = stateDefault
+			return m, nil
+		}
+		return m, nil
+	}
+
 	// Handle confirmation state
 	if m.state == stateConfirm {
 		shouldClose := m.confirmationOverlay.HandleKeyPress(msg)
@@ -490,6 +587,16 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 	}
 
 	switch name {
+	case keys.KeyAttach:
+		if m.instanceStarting {
+			return m, m.handleError(fmt.Errorf("please wait for the current session to finish starting"))
+		}
+		if m.list.NumInstances() >= GlobalInstanceLimit {
+			return m, m.handleError(
+				fmt.Errorf("you can't create more than %d instances", GlobalInstanceLimit))
+		}
+		m.state = stateAttach
+		return m, nil
 	case keys.KeyHelp:
 		return m.showHelpScreen(helpTypeGeneral{}, nil)
 	case keys.KeyPrompt:
@@ -557,19 +664,21 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 
 		// Create the kill action as a tea.Cmd
 		killAction := func() tea.Msg {
-			// Get worktree and check if branch is checked out
-			worktree, err := selected.GetGitWorktree()
-			if err != nil {
-				return err
-			}
+			// Only check branch checkout for worktree-backed instances
+			if selected.WorktreeMode == session.WorktreeNew {
+				worktree, err := selected.GetGitWorktree()
+				if err != nil {
+					return err
+				}
 
-			checkedOut, err := worktree.IsBranchCheckedOut()
-			if err != nil {
-				return err
-			}
+				checkedOut, err := worktree.IsBranchCheckedOut()
+				if err != nil {
+					return err
+				}
 
-			if checkedOut {
-				return fmt.Errorf("instance %s is currently checked out", selected.Title)
+				if checkedOut {
+					return fmt.Errorf("instance %s is currently checked out", selected.Title)
+				}
 			}
 
 			// Clean up terminal session for this instance
@@ -593,6 +702,9 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		if selected == nil || selected.Status == session.Loading {
 			return m, nil
 		}
+		if selected.WorktreeMode == session.WorktreeNone {
+			return m, m.handleError(fmt.Errorf("no worktree to push from"))
+		}
 
 		// Create the push action as a tea.Cmd
 		pushAction := func() tea.Msg {
@@ -615,6 +727,9 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		selected := m.list.GetSelectedInstance()
 		if selected == nil || selected.Status == session.Loading {
 			return m, nil
+		}
+		if selected.WorktreeMode == session.WorktreeNone {
+			return m, m.handleError(fmt.Errorf("no worktree to checkout"))
 		}
 
 		// Show help screen before pausing
@@ -840,7 +955,55 @@ func (m *home) View() string {
 			log.ErrorLog.Printf("confirmation overlay is nil")
 		}
 		return overlay.PlaceOverlay(0, 0, m.confirmationOverlay.Render(), mainView, true, true)
+	} else if m.state == stateAttach {
+		attachOverlay := m.renderAttachOverlay()
+		return overlay.PlaceOverlay(0, 0, attachOverlay, mainView, true, true)
+	} else if m.state == stateAttachPath {
+		pathOverlay := m.renderAttachPathOverlay()
+		return overlay.PlaceOverlay(0, 0, pathOverlay, mainView, true, true)
 	}
 
 	return mainView
+}
+
+// renderAttachOverlay renders the attach mode selector overlay.
+func (m *home) renderAttachOverlay() string {
+	style := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("62")).
+		Padding(1, 2).
+		Width(50)
+
+	highlightKey := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFCC00"))
+	content := lipgloss.JoinVertical(lipgloss.Left,
+		lipgloss.NewStyle().Bold(true).Underline(true).Foreground(lipgloss.Color("#7D56F4")).Render("Attach Mode"),
+		"",
+		highlightKey.Render("e")+" - Existing worktree (enter path)",
+		highlightKey.Render("n")+" - No worktree (run in current dir)",
+		"",
+		lipgloss.NewStyle().Foreground(lipgloss.Color("#777777")).Render("esc to cancel"),
+	)
+	return style.Render(content)
+}
+
+// renderAttachPathOverlay renders the path entry overlay for existing worktree attach.
+func (m *home) renderAttachPathOverlay() string {
+	style := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("62")).
+		Padding(1, 2).
+		Width(60)
+
+	pathDisplay := m.attachPath
+	if pathDisplay == "" {
+		pathDisplay = lipgloss.NewStyle().Foreground(lipgloss.Color("#777777")).Render("(type path to worktree)")
+	}
+	content := lipgloss.JoinVertical(lipgloss.Left,
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#7D56F4")).Render("Enter worktree path:"),
+		"",
+		pathDisplay+"█",
+		"",
+		lipgloss.NewStyle().Foreground(lipgloss.Color("#777777")).Render("enter to confirm, esc to cancel"),
+	)
+	return style.Render(content)
 }

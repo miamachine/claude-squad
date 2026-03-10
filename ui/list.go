@@ -185,6 +185,11 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, h
 	remainingWidth -= diffWidth
 
 	branch := i.Branch
+	if i.WorktreeMode == session.WorktreeNone {
+		branch = "(no worktree)"
+	} else if i.WorktreeMode == session.WorktreeExisting {
+		branch += " [ext]"
+	}
 	if i.Started() && hasMultipleRepos {
 		repoName, err := i.RepoName()
 		if err != nil {

@@ -27,6 +27,18 @@ const (
 	Paused
 )
 
+// WorktreeMode describes how the instance relates to a git worktree.
+type WorktreeMode int
+
+const (
+	// WorktreeNew means CS creates and owns the worktree (current default behavior).
+	WorktreeNew WorktreeMode = iota
+	// WorktreeExisting means the user's existing worktree is used; CS won't delete it.
+	WorktreeExisting
+	// WorktreeNone means no worktree; the instance runs in the repo cwd.
+	WorktreeNone
+)
+
 // Instance is a running instance of claude code.
 type Instance struct {
 	// Title is the title of the instance.
@@ -51,6 +63,8 @@ type Instance struct {
 	AutoYes bool
 	// Prompt is the initial prompt to pass to the instance on startup
 	Prompt string
+	// WorktreeMode describes how this instance relates to a git worktree.
+	WorktreeMode WorktreeMode
 
 	// DiffStats stores the current git diff statistics
 	diffStats *git.DiffStats
@@ -67,16 +81,17 @@ type Instance struct {
 // ToInstanceData converts an Instance to its serializable form
 func (i *Instance) ToInstanceData() InstanceData {
 	data := InstanceData{
-		Title:     i.Title,
-		Path:      i.Path,
-		Branch:    i.Branch,
-		Status:    i.Status,
-		Height:    i.Height,
-		Width:     i.Width,
-		CreatedAt: i.CreatedAt,
-		UpdatedAt: time.Now(),
-		Program:   i.Program,
-		AutoYes:   i.AutoYes,
+		Title:        i.Title,
+		Path:         i.Path,
+		Branch:       i.Branch,
+		Status:       i.Status,
+		Height:       i.Height,
+		Width:        i.Width,
+		CreatedAt:    i.CreatedAt,
+		UpdatedAt:    time.Now(),
+		Program:      i.Program,
+		AutoYes:      i.AutoYes,
+		WorktreeMode: int(i.WorktreeMode),
 	}
 
 	// Only include worktree data if gitWorktree is initialized
@@ -104,28 +119,35 @@ func (i *Instance) ToInstanceData() InstanceData {
 
 // FromInstanceData creates a new Instance from serialized data
 func FromInstanceData(data InstanceData) (*Instance, error) {
+	mode := WorktreeMode(data.WorktreeMode)
+
 	instance := &Instance{
-		Title:     data.Title,
-		Path:      data.Path,
-		Branch:    data.Branch,
-		Status:    data.Status,
-		Height:    data.Height,
-		Width:     data.Width,
-		CreatedAt: data.CreatedAt,
-		UpdatedAt: data.UpdatedAt,
-		Program:   data.Program,
-		gitWorktree: git.NewGitWorktreeFromStorage(
-			data.Worktree.RepoPath,
-			data.Worktree.WorktreePath,
-			data.Worktree.SessionName,
-			data.Worktree.BranchName,
-			data.Worktree.BaseCommitSHA,
-		),
+		Title:        data.Title,
+		Path:         data.Path,
+		Branch:       data.Branch,
+		Status:       data.Status,
+		Height:       data.Height,
+		Width:        data.Width,
+		CreatedAt:    data.CreatedAt,
+		UpdatedAt:    data.UpdatedAt,
+		Program:      data.Program,
+		WorktreeMode: mode,
 		diffStats: &git.DiffStats{
 			Added:   data.DiffStats.Added,
 			Removed: data.DiffStats.Removed,
 			Content: data.DiffStats.Content,
 		},
+	}
+
+	// Only restore gitWorktree for modes that use one.
+	if mode != WorktreeNone {
+		instance.gitWorktree = git.NewGitWorktreeFromStorage(
+			data.Worktree.RepoPath,
+			data.Worktree.WorktreePath,
+			data.Worktree.SessionName,
+			data.Worktree.BranchName,
+			data.Worktree.BaseCommitSHA,
+		)
 	}
 
 	if instance.Paused() {
@@ -150,6 +172,10 @@ type InstanceOptions struct {
 	Program string
 	// If AutoYes is true, then
 	AutoYes bool
+	// WorktreeMode controls how the instance relates to a git worktree.
+	WorktreeMode WorktreeMode
+	// ExistingWorktreePath is the path to a pre-existing worktree (only used with WorktreeExisting).
+	ExistingWorktreePath string
 }
 
 func NewInstance(opts InstanceOptions) (*Instance, error) {
@@ -161,22 +187,37 @@ func NewInstance(opts InstanceOptions) (*Instance, error) {
 		return nil, fmt.Errorf("failed to get absolute path: %w", err)
 	}
 
-	return &Instance{
-		Title:     opts.Title,
-		Status:    Ready,
-		Path:      absPath,
-		Program:   opts.Program,
-		Height:    0,
-		Width:     0,
-		CreatedAt: t,
-		UpdatedAt: t,
-		AutoYes:   false,
-	}, nil
+	inst := &Instance{
+		Title:        opts.Title,
+		Status:       Ready,
+		Path:         absPath,
+		Program:      opts.Program,
+		Height:       0,
+		Width:        0,
+		CreatedAt:    t,
+		UpdatedAt:    t,
+		AutoYes:      false,
+		WorktreeMode: opts.WorktreeMode,
+	}
+
+	// For existing worktrees, store the worktree path as the instance path.
+	if opts.WorktreeMode == WorktreeExisting && opts.ExistingWorktreePath != "" {
+		existingAbs, err := filepath.Abs(opts.ExistingWorktreePath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get absolute path for existing worktree: %w", err)
+		}
+		inst.Path = existingAbs
+	}
+
+	return inst, nil
 }
 
 func (i *Instance) RepoName() (string, error) {
 	if !i.started {
 		return "", fmt.Errorf("cannot get repo name for instance that has not been started")
+	}
+	if i.gitWorktree == nil {
+		return filepath.Base(i.Path), nil
 	}
 	return i.gitWorktree.GetRepoName(), nil
 }
@@ -202,12 +243,24 @@ func (i *Instance) Start(firstTimeSetup bool) error {
 	i.tmuxSession = tmuxSession
 
 	if firstTimeSetup {
-		gitWorktree, branchName, err := git.NewGitWorktree(i.Path, i.Title)
-		if err != nil {
-			return fmt.Errorf("failed to create git worktree: %w", err)
+		switch i.WorktreeMode {
+		case WorktreeNew:
+			gitWorktree, branchName, err := git.NewGitWorktree(i.Path, i.Title)
+			if err != nil {
+				return fmt.Errorf("failed to create git worktree: %w", err)
+			}
+			i.gitWorktree = gitWorktree
+			i.Branch = branchName
+		case WorktreeExisting:
+			gitWorktree, branchName, err := git.NewGitWorktreeFromExisting(i.Path)
+			if err != nil {
+				return fmt.Errorf("failed to wrap existing worktree: %w", err)
+			}
+			i.gitWorktree = gitWorktree
+			i.Branch = branchName
+		case WorktreeNone:
+			// No worktree to create; i.Path is used directly as the working directory.
 		}
-		i.gitWorktree = gitWorktree
-		i.Branch = branchName
 	}
 
 	// Setup error handler to cleanup resources on any error
@@ -229,20 +282,33 @@ func (i *Instance) Start(firstTimeSetup bool) error {
 			return setupErr
 		}
 	} else {
-		// Setup git worktree first
-		if err := i.gitWorktree.Setup(); err != nil {
-			setupErr = fmt.Errorf("failed to setup git worktree: %w", err)
-			return setupErr
-		}
-
-		// Create new session
-		if err := i.tmuxSession.Start(i.gitWorktree.GetWorktreePath()); err != nil {
-			// Cleanup git worktree if tmux session creation fails
-			if cleanupErr := i.gitWorktree.Cleanup(); cleanupErr != nil {
-				err = fmt.Errorf("%v (cleanup error: %v)", err, cleanupErr)
+		switch i.WorktreeMode {
+		case WorktreeNew:
+			// Setup git worktree first
+			if err := i.gitWorktree.Setup(); err != nil {
+				setupErr = fmt.Errorf("failed to setup git worktree: %w", err)
+				return setupErr
 			}
-			setupErr = fmt.Errorf("failed to start new session: %w", err)
-			return setupErr
+			// Create new session in worktree path
+			if err := i.tmuxSession.Start(i.gitWorktree.GetWorktreePath()); err != nil {
+				if cleanupErr := i.gitWorktree.Cleanup(); cleanupErr != nil {
+					err = fmt.Errorf("%v (cleanup error: %v)", err, cleanupErr)
+				}
+				setupErr = fmt.Errorf("failed to start new session: %w", err)
+				return setupErr
+			}
+		case WorktreeExisting:
+			// Worktree already exists, just start tmux there
+			if err := i.tmuxSession.Start(i.gitWorktree.GetWorktreePath()); err != nil {
+				setupErr = fmt.Errorf("failed to start new session: %w", err)
+				return setupErr
+			}
+		case WorktreeNone:
+			// Start tmux in the instance path directly
+			if err := i.tmuxSession.Start(i.Path); err != nil {
+				setupErr = fmt.Errorf("failed to start new session: %w", err)
+				return setupErr
+			}
 		}
 	}
 
@@ -260,16 +326,17 @@ func (i *Instance) Kill() error {
 
 	var errs []error
 
-	// Always try to cleanup both resources, even if one fails
-	// Clean up tmux session first since it's using the git worktree
+	// Always try to cleanup tmux session first since it's using the git worktree
 	if i.tmuxSession != nil {
 		if err := i.tmuxSession.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("failed to close tmux session: %w", err))
 		}
 	}
 
-	// Then clean up git worktree
-	if i.gitWorktree != nil {
+	// Only clean up git worktree for WorktreeNew (CS-owned) instances.
+	// WorktreeExisting: leave the user's worktree alone.
+	// WorktreeNone: no worktree to clean up.
+	if i.WorktreeMode == WorktreeNew && i.gitWorktree != nil {
 		if err := i.gitWorktree.Cleanup(); err != nil {
 			errs = append(errs, fmt.Errorf("failed to cleanup git worktree: %w", err))
 		}
@@ -397,42 +464,63 @@ func (i *Instance) Pause() error {
 
 	var errs []error
 
-	// Check if there are any changes to commit
-	if dirty, err := i.gitWorktree.IsDirty(); err != nil {
-		errs = append(errs, fmt.Errorf("failed to check if worktree is dirty: %w", err))
-		log.ErrorLog.Print(err)
-	} else if dirty {
-		// Commit changes locally (without pushing to GitHub)
-		commitMsg := fmt.Sprintf("[claudesquad] update from '%s' on %s (paused)", i.Title, time.Now().Format(time.RFC822))
-		if err := i.gitWorktree.CommitChanges(commitMsg); err != nil {
-			errs = append(errs, fmt.Errorf("failed to commit changes: %w", err))
+	switch i.WorktreeMode {
+	case WorktreeNew:
+		// Commit changes, detach tmux, remove worktree (original behavior)
+		if dirty, err := i.gitWorktree.IsDirty(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to check if worktree is dirty: %w", err))
 			log.ErrorLog.Print(err)
-			// Return early if we can't commit changes to avoid corrupted state
-			return i.combineErrors(errs)
-		}
-	}
-
-	// Detach from tmux session instead of closing to preserve session output
-	if err := i.tmuxSession.DetachSafely(); err != nil {
-		errs = append(errs, fmt.Errorf("failed to detach tmux session: %w", err))
-		log.ErrorLog.Print(err)
-		// Continue with pause process even if detach fails
-	}
-
-	// Check if worktree exists before trying to remove it
-	if _, err := os.Stat(i.gitWorktree.GetWorktreePath()); err == nil {
-		// Remove worktree but keep branch
-		if err := i.gitWorktree.Remove(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to remove git worktree: %w", err))
-			log.ErrorLog.Print(err)
-			return i.combineErrors(errs)
+		} else if dirty {
+			commitMsg := fmt.Sprintf("[claudesquad] update from '%s' on %s (paused)", i.Title, time.Now().Format(time.RFC822))
+			if err := i.gitWorktree.CommitChanges(commitMsg); err != nil {
+				errs = append(errs, fmt.Errorf("failed to commit changes: %w", err))
+				log.ErrorLog.Print(err)
+				return i.combineErrors(errs)
+			}
 		}
 
-		// Only prune if remove was successful
-		if err := i.gitWorktree.Prune(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to prune git worktrees: %w", err))
+		if err := i.tmuxSession.DetachSafely(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to detach tmux session: %w", err))
 			log.ErrorLog.Print(err)
-			return i.combineErrors(errs)
+		}
+
+		if _, err := os.Stat(i.gitWorktree.GetWorktreePath()); err == nil {
+			if err := i.gitWorktree.Remove(); err != nil {
+				errs = append(errs, fmt.Errorf("failed to remove git worktree: %w", err))
+				log.ErrorLog.Print(err)
+				return i.combineErrors(errs)
+			}
+			if err := i.gitWorktree.Prune(); err != nil {
+				errs = append(errs, fmt.Errorf("failed to prune git worktrees: %w", err))
+				log.ErrorLog.Print(err)
+				return i.combineErrors(errs)
+			}
+		}
+
+	case WorktreeExisting:
+		// Commit changes but do NOT remove the user's worktree
+		if dirty, err := i.gitWorktree.IsDirty(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to check if worktree is dirty: %w", err))
+			log.ErrorLog.Print(err)
+		} else if dirty {
+			commitMsg := fmt.Sprintf("[claudesquad] update from '%s' on %s (paused)", i.Title, time.Now().Format(time.RFC822))
+			if err := i.gitWorktree.CommitChanges(commitMsg); err != nil {
+				errs = append(errs, fmt.Errorf("failed to commit changes: %w", err))
+				log.ErrorLog.Print(err)
+				return i.combineErrors(errs)
+			}
+		}
+
+		if err := i.tmuxSession.DetachSafely(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to detach tmux session: %w", err))
+			log.ErrorLog.Print(err)
+		}
+
+	case WorktreeNone:
+		// Just detach tmux, no git operations
+		if err := i.tmuxSession.DetachSafely(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to detach tmux session: %w", err))
+			log.ErrorLog.Print(err)
 		}
 	}
 
@@ -442,7 +530,9 @@ func (i *Instance) Pause() error {
 	}
 
 	i.SetStatus(Paused)
-	_ = clipboard.WriteAll(i.gitWorktree.GetBranchName())
+	if i.gitWorktree != nil {
+		_ = clipboard.WriteAll(i.gitWorktree.GetBranchName())
+	}
 	return nil
 }
 
@@ -455,44 +545,59 @@ func (i *Instance) Resume() error {
 		return fmt.Errorf("can only resume paused instances")
 	}
 
-	// Check if branch is checked out
-	if checked, err := i.gitWorktree.IsBranchCheckedOut(); err != nil {
-		log.ErrorLog.Print(err)
-		return fmt.Errorf("failed to check if branch is checked out: %w", err)
-	} else if checked {
-		return fmt.Errorf("cannot resume: branch is checked out, please switch to a different branch")
-	}
+	// Determine the working directory for the tmux session
+	var workDir string
 
-	// Setup git worktree
-	if err := i.gitWorktree.Setup(); err != nil {
-		log.ErrorLog.Print(err)
-		return fmt.Errorf("failed to setup git worktree: %w", err)
+	switch i.WorktreeMode {
+	case WorktreeNew:
+		// Check if branch is checked out
+		if checked, err := i.gitWorktree.IsBranchCheckedOut(); err != nil {
+			log.ErrorLog.Print(err)
+			return fmt.Errorf("failed to check if branch is checked out: %w", err)
+		} else if checked {
+			return fmt.Errorf("cannot resume: branch is checked out, please switch to a different branch")
+		}
+
+		// Recreate the worktree from the branch
+		if err := i.gitWorktree.Setup(); err != nil {
+			log.ErrorLog.Print(err)
+			return fmt.Errorf("failed to setup git worktree: %w", err)
+		}
+		workDir = i.gitWorktree.GetWorktreePath()
+
+	case WorktreeExisting:
+		// Worktree already exists on disk, no setup needed
+		workDir = i.gitWorktree.GetWorktreePath()
+
+	case WorktreeNone:
+		// No worktree, use instance path
+		workDir = i.Path
 	}
 
 	// Check if tmux session still exists from pause, otherwise create new one
 	if i.tmuxSession.DoesSessionExist() {
-		// Session exists, just restore PTY connection to it
 		if err := i.tmuxSession.Restore(); err != nil {
 			log.ErrorLog.Print(err)
 			// If restore fails, fall back to creating new session
-			if err := i.tmuxSession.Start(i.gitWorktree.GetWorktreePath()); err != nil {
+			if err := i.tmuxSession.Start(workDir); err != nil {
 				log.ErrorLog.Print(err)
-				// Cleanup git worktree if tmux session creation fails
-				if cleanupErr := i.gitWorktree.Cleanup(); cleanupErr != nil {
-					err = fmt.Errorf("%v (cleanup error: %v)", err, cleanupErr)
-					log.ErrorLog.Print(err)
+				if i.WorktreeMode == WorktreeNew && i.gitWorktree != nil {
+					if cleanupErr := i.gitWorktree.Cleanup(); cleanupErr != nil {
+						err = fmt.Errorf("%v (cleanup error: %v)", err, cleanupErr)
+						log.ErrorLog.Print(err)
+					}
 				}
 				return fmt.Errorf("failed to start new session: %w", err)
 			}
 		}
 	} else {
-		// Create new tmux session
-		if err := i.tmuxSession.Start(i.gitWorktree.GetWorktreePath()); err != nil {
+		if err := i.tmuxSession.Start(workDir); err != nil {
 			log.ErrorLog.Print(err)
-			// Cleanup git worktree if tmux session creation fails
-			if cleanupErr := i.gitWorktree.Cleanup(); cleanupErr != nil {
-				err = fmt.Errorf("%v (cleanup error: %v)", err, cleanupErr)
-				log.ErrorLog.Print(err)
+			if i.WorktreeMode == WorktreeNew && i.gitWorktree != nil {
+				if cleanupErr := i.gitWorktree.Cleanup(); cleanupErr != nil {
+					err = fmt.Errorf("%v (cleanup error: %v)", err, cleanupErr)
+					log.ErrorLog.Print(err)
+				}
 			}
 			return fmt.Errorf("failed to start new session: %w", err)
 		}
@@ -504,7 +609,7 @@ func (i *Instance) Resume() error {
 
 // UpdateDiffStats updates the git diff statistics for this instance
 func (i *Instance) UpdateDiffStats() error {
-	if !i.started {
+	if !i.started || i.gitWorktree == nil {
 		i.diffStats = nil
 		return nil
 	}
@@ -531,7 +636,7 @@ func (i *Instance) UpdateDiffStats() error {
 // ComputeDiff runs the expensive git diff I/O and returns the result without
 // mutating instance state. Safe to call from a background goroutine.
 func (i *Instance) ComputeDiff() *git.DiffStats {
-	if !i.started || i.Status == Paused {
+	if !i.started || i.Status == Paused || i.gitWorktree == nil {
 		return nil
 	}
 	return i.gitWorktree.Diff()

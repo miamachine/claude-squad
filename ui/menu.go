@@ -53,7 +53,7 @@ type Menu struct {
 	keyDown keys.KeyName
 }
 
-var defaultMenuOptions = []keys.KeyName{keys.KeyNew, keys.KeyPrompt, keys.KeyHelp, keys.KeyQuit}
+var defaultMenuOptions = []keys.KeyName{keys.KeyNew, keys.KeyAttach, keys.KeyPrompt, keys.KeyHelp, keys.KeyQuit}
 var newInstanceMenuOptions = []keys.KeyName{keys.KeySubmitName}
 var promptMenuOptions = []keys.KeyName{keys.KeySubmitName}
 
@@ -131,10 +131,16 @@ func (m *Menu) addInstanceOptions() {
 	options := []keys.KeyName{keys.KeyNew, keys.KeyKill}
 
 	// Action group
-	actionGroup := []keys.KeyName{keys.KeyEnter, keys.KeySubmit}
+	actionGroup := []keys.KeyName{keys.KeyEnter}
+
+	// Only show push/checkout for instances with worktrees
+	if m.instance.WorktreeMode != session.WorktreeNone {
+		actionGroup = append(actionGroup, keys.KeySubmit)
+	}
+
 	if m.instance.Status == session.Paused {
 		actionGroup = append(actionGroup, keys.KeyResume)
-	} else {
+	} else if m.instance.WorktreeMode != session.WorktreeNone {
 		actionGroup = append(actionGroup, keys.KeyCheckout)
 	}
 
