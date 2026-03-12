@@ -56,7 +56,9 @@ const (
 	stateAttachList
 	// stateAttachPath is the state when the user is entering a worktree path.
 	stateAttachPath
-	// stateDirPath is the state when the user is entering a directory path for no-worktree mode.
+	// stateDirSelect is the state when the user is picking a directory for no-worktree mode.
+	stateDirSelect
+	// stateDirPath is the state when the user is entering a directory path manually.
 	stateDirPath
 )
 
@@ -383,7 +385,7 @@ func (m *home) handleMenuHighlighting(msg tea.KeyMsg) (cmd tea.Cmd, returnEarly 
 	}
 	if m.state == statePrompt || m.state == stateHelp || m.state == stateConfirm ||
 		m.state == stateNewMenu || m.state == stateRepoSelect || m.state == stateAttachList ||
-		m.state == stateAttachPath || m.state == stateDirPath {
+		m.state == stateAttachPath || m.state == stateDirSelect || m.state == stateDirPath {
 		return nil, false
 	}
 	// If it's in the global keymap, we should try to highlight it.
@@ -593,9 +595,21 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 			m.menu.SetState(ui.StateNewInstance)
 			return m, nil
 		case "d":
-			// No worktree, different directory — enter path
-			m.dirPath = ""
-			m.state = stateDirPath
+			// No worktree, different directory — show directory picker
+			dirs := m.discoverDirectories()
+			if len(dirs) == 0 {
+				// No known directories, fall back to manual path entry
+				m.dirPath = ""
+				m.state = stateDirPath
+				return m, nil
+			}
+			m.selectionOverlay = overlay.NewSelectionOverlay(
+				"Select Directory",
+				dirs,
+				"↑/↓ navigate • enter select • p type path • esc cancel",
+			)
+			m.selectionOverlay.SetWidth(60)
+			m.state = stateDirSelect
 			return m, nil
 		case "esc", "ctrl+c":
 			m.state = stateDefault
@@ -767,7 +781,57 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		return m, nil
 	}
 
-	// Handle directory path entry state (no worktree, different directory)
+	// Handle directory selection state (no worktree, different directory)
+	if m.state == stateDirSelect {
+		// "p" falls back to manual path entry
+		if msg.String() == "p" {
+			m.dirPath = ""
+			m.selectionOverlay = nil
+			m.state = stateDirPath
+			return m, nil
+		}
+
+		shouldClose := m.selectionOverlay.HandleKeyPress(msg)
+		if shouldClose {
+			if m.selectionOverlay.Selected {
+				item := m.selectionOverlay.GetSelectedItem()
+				if item == nil {
+					m.state = stateDefault
+					m.selectionOverlay = nil
+					return m, nil
+				}
+				selectedDir := item.Value
+				m.selectionOverlay = nil
+
+				if m.list.NumInstances() >= GlobalInstanceLimit {
+					m.state = stateDefault
+					return m, m.handleError(fmt.Errorf("you can't create more than %d instances", GlobalInstanceLimit))
+				}
+				instance, err := session.NewInstance(session.InstanceOptions{
+					Title:        "",
+					Path:         selectedDir,
+					Program:      m.program,
+					WorktreeMode: session.WorktreeNone,
+				})
+				if err != nil {
+					m.state = stateDefault
+					return m, m.handleError(err)
+				}
+				m.newInstanceFinalizer = m.list.AddInstance(instance)
+				m.list.SetSelectedInstance(m.list.NumInstances() - 1)
+				m.state = stateNew
+				m.menu.SetState(ui.StateNewInstance)
+				return m, nil
+			}
+			// Cancelled
+			m.state = stateDefault
+			m.selectionOverlay = nil
+			return m, nil
+		}
+		return m, nil
+	}
+
+	// Handle directory path entry state (manual fallback)
 	if m.state == stateDirPath {
 		switch msg.Type {
 		case tea.KeyEnter:
@@ -1278,6 +1342,11 @@ func (m *home) View() string {
 	} else if m.state == stateAttachPath {
 		pathOverlay := m.renderAttachPathOverlay()
 		return overlay.PlaceOverlay(0, 0, pathOverlay, mainView, true, true)
+	} else if m.state == stateDirSelect {
+		if m.selectionOverlay == nil {
+			log.ErrorLog.Printf("selection overlay is nil")
+		}
+		return overlay.PlaceOverlay(0, 0, m.selectionOverlay.Render(), mainView, true, true)
 	} else if m.state == stateDirPath {
 		dirOverlay := m.renderDirPathOverlay()
 		return overlay.PlaceOverlay(0, 0, dirOverlay, mainView, true, true)
@@ -1358,6 +1427,62 @@ func (m *home) discoverRepos() []overlay.SelectionItem {
 					Description: root,
 					Value:       root,
 				})
+			}
+		}
+	}
+
+	return items
+}
+
+// discoverDirectories finds known directories for the directory picker.
+// Sources: instance paths, worktree paths, home directory, and ~/projects/ subdirectories.
+func (m *home) discoverDirectories() []overlay.SelectionItem {
+	seen := make(map[string]bool)
+	var items []overlay.SelectionItem
+
+	addDir := func(dir, label string) {
+		if dir == "" || seen[dir] {
+			return
+		}
+		info, err := os.Stat(dir)
+		if err != nil || !info.IsDir() {
+			return
+		}
+		seen[dir] = true
+		if label == "" {
+			label = filepath.Base(dir)
+		}
+		items = append(items, overlay.SelectionItem{
+			Label:       label,
+			Description: dir,
+			Value:       dir,
+		})
+	}
+
+	// 1. Current working directory
+	cwd, _ := os.Getwd()
+	addDir(cwd, filepath.Base(cwd)+" (cwd)")
+
+	// 2. Paths from existing CS instances
+	for _, inst := range m.list.GetInstances() {
+		addDir(inst.Path, "")
+		addDir(inst.GetWorktreePath(), "")
+	}
+
+	// 3. Home directory
+	home, _ := os.UserHomeDir()
+	if home != "" {
+		addDir(home, "~ (home)")
+	}
+
+	// 4. Scan ~/projects/ for subdirectories (common project location)
+	if home != "" {
+		projectsDir := filepath.Join(home, "projects")
+		if entries, err := os.ReadDir(projectsDir); err == nil {
+			for _, entry := range entries {
+				if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
+					addDir(filepath.Join(projectsDir, entry.Name()), "")
+				}
 			}
 		}
 	}
