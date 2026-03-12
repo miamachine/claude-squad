@@ -1431,6 +1431,31 @@ func (m *home) discoverRepos() []overlay.SelectionItem {
 		}
 	}
 
+	// 4. Scan well-known project directories for git repos
+	home, _ := os.UserHomeDir()
+	if home != "" {
+		for _, dir := range []string{"projects", "claude"} {
+			parentDir := filepath.Join(home, dir)
+			if entries, err := os.ReadDir(parentDir); err == nil {
+				for _, entry := range entries {
+					if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
+						subdir := filepath.Join(parentDir, entry.Name())
+						if git.IsGitRepo(subdir) {
+							if root, err := git.FindGitRepoRoot(subdir); err == nil && !seen[root] {
+								seen[root] = true
+								items = append(items, overlay.SelectionItem{
+									Label:       filepath.Base(root),
+									Description: root,
+									Value:       root,
+								})
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	return items
 }
 
@@ -1475,13 +1500,15 @@ func (m *home) discoverDirectories() []overlay.SelectionItem {
 		addDir(home, "~ (home)")
 	}
 
-	// 4. Scan ~/projects/ for subdirectories (common project location)
+	// 4. Scan well-known project directories for subdirectories
 	if home != "" {
-		projectsDir := filepath.Join(home, "projects")
-		if entries, err := os.ReadDir(projectsDir); err == nil {
-			for _, entry := range entries {
-				if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
-					addDir(filepath.Join(projectsDir, entry.Name()), "")
+		for _, dir := range []string{"projects", "claude"} {
+			parentDir := filepath.Join(home, dir)
+			if entries, err := os.ReadDir(parentDir); err == nil {
+				for _, entry := range entries {
+					if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
+						addDir(filepath.Join(parentDir, entry.Name()), "")
+					}
 				}
 			}
 		}
