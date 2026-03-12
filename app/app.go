@@ -4,6 +4,7 @@ import (
 	"claude-squad/config"
 	"claude-squad/keys"
 	"claude-squad/log"
+	"claude-squad/pipeline"
 	"claude-squad/session"
 	"claude-squad/session/git"
 	"claude-squad/ui"
@@ -11,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -46,12 +48,16 @@ const (
 	stateHelp
 	// stateConfirm is the state when a confirmation modal is displayed.
 	stateConfirm
-	// stateAttachMenu is the state when the user is choosing an attach mode.
-	stateAttachMenu
+	// stateNewMenu is the state when the user is choosing a new-instance mode (n key submenu).
+	stateNewMenu
+	// stateRepoSelect is the state when the user is picking a repo for a new worktree.
+	stateRepoSelect
 	// stateAttachList is the state when the user is picking from a list of existing worktrees.
 	stateAttachList
 	// stateAttachPath is the state when the user is entering a worktree path.
 	stateAttachPath
+	// stateDirPath is the state when the user is entering a directory path for no-worktree mode.
+	stateDirPath
 )
 
 type home struct {
@@ -104,12 +110,21 @@ type home struct {
 	// selectionOverlay displays a scrollable list picker
 	selectionOverlay *overlay.SelectionOverlay
 
-	// -- Attach mode fields --
+	// -- Attach/New mode fields --
 
 	// attachMode is the worktree mode selected during attach flow.
 	attachMode session.WorktreeMode
 	// attachPath is the worktree path being entered during stateAttachPath.
 	attachPath string
+	// dirPath is the directory path being entered during stateDirPath.
+	dirPath string
+	// selectedRepoPath is the repo path selected during stateRepoSelect for new worktree creation.
+	selectedRepoPath string
+
+	// -- Pipeline fields --
+
+	// agentDir is the path to the agent directory (e.g. ~/agent-mia)
+	agentDir string
 }
 
 func newHome(ctx context.Context, program string, autoYes bool) *home {
@@ -126,11 +141,18 @@ func newHome(ctx context.Context, program string, autoYes bool) *home {
 		os.Exit(1)
 	}
 
+	// Resolve agent directory from env or default to ~/agent-mia
+	agentDir := os.Getenv("AGENT_DIR")
+	if agentDir == "" {
+		home, _ := os.UserHomeDir()
+		agentDir = filepath.Join(home, "agent-mia")
+	}
+
 	h := &home{
 		ctx:          ctx,
 		spinner:      spinner.New(spinner.WithSpinner(spinner.MiniDot)),
 		menu:         ui.NewMenu(),
-		tabbedWindow: ui.NewTabbedWindow(ui.NewPreviewPane(), ui.NewDiffPane(), ui.NewTerminalPane()),
+		tabbedWindow: ui.NewTabbedWindow(ui.NewPreviewPane(), ui.NewDiffPane(), ui.NewTerminalPane(), ui.NewPipelinePane()),
 		errBox:       ui.NewErrBox(),
 		storage:      storage,
 		appConfig:    appConfig,
@@ -138,6 +160,7 @@ func newHome(ctx context.Context, program string, autoYes bool) *home {
 		autoYes:      autoYes,
 		state:        stateDefault,
 		appState:     appState,
+		agentDir:     agentDir,
 	}
 	h.list = ui.NewList(&h.spinner, autoYes)
 
@@ -199,6 +222,7 @@ func (m *home) Init() tea.Cmd {
 			return previewTickMsg{}
 		},
 		tickUpdateMetadataCmd(m.list.GetInstances()),
+		pipelineTick(),
 	)
 }
 
@@ -237,6 +261,48 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, tickUpdateMetadataCmd(m.list.GetInstances())
+	case pipelineTickMsg:
+		instances := m.list.GetInstances()
+		agentDir := m.agentDir
+		return m, func() tea.Msg {
+			infos := make([]pipeline.InstanceInfo, len(instances))
+			for i, inst := range instances {
+				status := "Unknown"
+				switch inst.Status {
+				case session.Running:
+					status = "Running"
+				case session.Ready:
+					status = "Ready"
+				case session.Loading:
+					status = "Loading"
+				case session.Paused:
+					status = "Paused"
+				}
+				var added, removed int
+				if stats := inst.GetDiffStats(); stats != nil && stats.Error == nil {
+					added = stats.Added
+					removed = stats.Removed
+				}
+				infos[i] = pipeline.InstanceInfo{
+					Title:       inst.Title,
+					Branch:      inst.Branch,
+					Status:      status,
+					DiffAdded:   added,
+					DiffRemoved: removed,
+				}
+			}
+			items, err := pipeline.Load(
+				filepath.Join(agentDir, "tasks"),
+				filepath.Join(agentDir, "sessions.json"),
+				infos,
+			)
+			return pipelineUpdateDoneMsg{items: items, err: err}
+		}
+	case pipelineUpdateDoneMsg:
+		if msg.err == nil {
+			m.tabbedWindow.UpdatePipelineData(msg.items)
+		}
+		return m, pipelineTick()
 	case tea.MouseMsg:
 		// Handle mouse wheel events for scrolling the diff/preview pane
 		if msg.Action == tea.MouseActionPress {
@@ -316,7 +382,8 @@ func (m *home) handleMenuHighlighting(msg tea.KeyMsg) (cmd tea.Cmd, returnEarly 
 		return nil, false
 	}
 	if m.state == statePrompt || m.state == stateHelp || m.state == stateConfirm ||
-		m.state == stateAttachMenu || m.state == stateAttachList || m.state == stateAttachPath {
+		m.state == stateNewMenu || m.state == stateRepoSelect || m.state == stateAttachList ||
+		m.state == stateAttachPath || m.state == stateDirPath {
 		return nil, false
 	}
 	// If it's in the global keymap, we should try to highlight it.
@@ -463,70 +530,49 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		return m, nil
 	}
 
-	// Handle attach menu state (3-option picker: w/e/n)
-	if m.state == stateAttachMenu {
+	// Handle new-instance submenu (n key → w/n/d options)
+	if m.state == stateNewMenu {
 		switch msg.String() {
 		case "w":
-			// New worktree — same flow as KeyNew
-			cwd, _ := os.Getwd()
-			if !git.IsGitRepo(cwd) {
+			// New worktree — show repo picker
+			repos := m.discoverRepos()
+			if len(repos) == 0 {
 				m.state = stateDefault
-				return m, m.handleError(fmt.Errorf("not in a git repository — use 'n' for no worktree"))
+				return m, m.handleError(fmt.Errorf("no git repositories found — use 'n' for no worktree"))
 			}
-			if m.list.NumInstances() >= GlobalInstanceLimit {
-				m.state = stateDefault
-				return m, m.handleError(fmt.Errorf("you can't create more than %d instances", GlobalInstanceLimit))
-			}
-			instance, err := session.NewInstance(session.InstanceOptions{
-				Title:   "",
-				Path:    ".",
-				Program: m.program,
-			})
-			if err != nil {
-				m.state = stateDefault
-				return m, m.handleError(err)
-			}
-			m.newInstanceFinalizer = m.list.AddInstance(instance)
-			m.list.SetSelectedInstance(m.list.NumInstances() - 1)
-			m.state = stateNew
-			m.menu.SetState(ui.StateNewInstance)
-			return m, nil
-		case "e":
-			// Existing worktree — show worktree picker list
-			cwd, _ := os.Getwd()
-			if !git.IsGitRepo(cwd) {
-				m.state = stateDefault
-				return m, m.handleError(fmt.Errorf("not in a git repository — use 'n' for no worktree"))
-			}
-			worktrees, err := git.ListWorktrees(cwd)
-			if err != nil {
-				m.state = stateDefault
-				return m, m.handleError(fmt.Errorf("failed to list worktrees: %w", err))
-			}
-			if len(worktrees) == 0 {
-				m.state = stateDefault
-				return m, m.handleError(fmt.Errorf("no linked worktrees found — use 'w' to create a new one"))
-			}
-			// Build selection items
-			items := make([]overlay.SelectionItem, len(worktrees))
-			for i, wt := range worktrees {
-				items[i] = overlay.SelectionItem{
-					Label:       wt.Branch,
-					Description: wt.Path,
-					Value:       wt.Path,
+			if len(repos) == 1 {
+				// Only one repo, skip the picker and use it directly.
+				m.selectedRepoPath = repos[0].Value
+				if m.list.NumInstances() >= GlobalInstanceLimit {
+					m.state = stateDefault
+					return m, m.handleError(fmt.Errorf("you can't create more than %d instances", GlobalInstanceLimit))
 				}
+				instance, err := session.NewInstance(session.InstanceOptions{
+					Title:   "",
+					Path:    m.selectedRepoPath,
+					Program: m.program,
+				})
+				if err != nil {
+					m.state = stateDefault
+					return m, m.handleError(err)
+				}
+				m.newInstanceFinalizer = m.list.AddInstance(instance)
+				m.list.SetSelectedInstance(m.list.NumInstances() - 1)
+				m.state = stateNew
+				m.menu.SetState(ui.StateNewInstance)
+				return m, nil
 			}
+			// Multiple repos — show picker
 			m.selectionOverlay = overlay.NewSelectionOverlay(
-				"Select Existing Worktree",
-				items,
-				"↑/↓ navigate • enter select • p type path • esc cancel",
+				"Select Repository",
+				repos,
+				"↑/↓ navigate • enter select • esc cancel",
 			)
-			m.selectionOverlay.SetWidth(55)
-			m.state = stateAttachList
+			m.selectionOverlay.SetWidth(60)
+			m.state = stateRepoSelect
 			return m, nil
 		case "n":
-			// No worktree mode → create instance, enter title
-			m.attachMode = session.WorktreeNone
+			// No worktree, run in current directory
 			if m.list.NumInstances() >= GlobalInstanceLimit {
 				m.state = stateDefault
 				return m, m.handleError(fmt.Errorf("you can't create more than %d instances", GlobalInstanceLimit))
@@ -546,8 +592,54 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 			m.state = stateNew
 			m.menu.SetState(ui.StateNewInstance)
 			return m, nil
+		case "d":
+			// No worktree, different directory — enter path
+			m.dirPath = ""
+			m.state = stateDirPath
+			return m, nil
 		case "esc", "ctrl+c":
 			m.state = stateDefault
+			return m, nil
+		}
+		return m, nil
+	}
+
+	// Handle repo selection for new worktree
+	if m.state == stateRepoSelect {
+		shouldClose := m.selectionOverlay.HandleKeyPress(msg)
+		if shouldClose {
+			if m.selectionOverlay.Selected {
+				item := m.selectionOverlay.GetSelectedItem()
+				if item == nil {
+					m.state = stateDefault
+					m.selectionOverlay = nil
+					return m, nil
+				}
+				m.selectedRepoPath = item.Value
+				m.selectionOverlay = nil
+
+				if m.list.NumInstances() >= GlobalInstanceLimit {
+					m.state = stateDefault
+					return m, m.handleError(fmt.Errorf("you can't create more than %d instances", GlobalInstanceLimit))
+				}
+				instance, err := session.NewInstance(session.InstanceOptions{
+					Title:   "",
+					Path:    m.selectedRepoPath,
+					Program: m.program,
+				})
+				if err != nil {
+					m.state = stateDefault
+					return m, m.handleError(err)
+				}
+				m.newInstanceFinalizer = m.list.AddInstance(instance)
+				m.list.SetSelectedInstance(m.list.NumInstances() - 1)
+				m.state = stateNew
+				m.menu.SetState(ui.StateNewInstance)
+				return m, nil
+			}
+			// Cancelled
+			m.state = stateDefault
+			m.selectionOverlay = nil
 			return m, nil
 		}
 		return m, nil
@@ -675,6 +767,56 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		return m, nil
 	}
 
+	// Handle directory path entry state (no worktree, different directory)
+	if m.state == stateDirPath {
+		switch msg.Type {
+		case tea.KeyEnter:
+			if m.dirPath == "" {
+				return m, m.handleError(fmt.Errorf("path cannot be empty"))
+			}
+			// Validate the path exists and is a directory
+			info, err := os.Stat(m.dirPath)
+			if err != nil {
+				return m, m.handleError(fmt.Errorf("path does not exist: %s", m.dirPath))
+			}
+			if !info.IsDir() {
+				return m, m.handleError(fmt.Errorf("path is not a directory: %s", m.dirPath))
+			}
+			if m.list.NumInstances() >= GlobalInstanceLimit {
+				m.state = stateDefault
+				return m, m.handleError(fmt.Errorf("you can't create more than %d instances", GlobalInstanceLimit))
+			}
+			instance, err := session.NewInstance(session.InstanceOptions{
+				Title:        "",
+				Path:         m.dirPath,
+				Program:      m.program,
+				WorktreeMode: session.WorktreeNone,
+			})
+			if err != nil {
+				m.state = stateDefault
+				return m, m.handleError(err)
+			}
+			m.newInstanceFinalizer = m.list.AddInstance(instance)
+			m.list.SetSelectedInstance(m.list.NumInstances() - 1)
+			m.state = stateNew
+			m.menu.SetState(ui.StateNewInstance)
+			return m, nil
+		case tea.KeyRunes:
+			m.dirPath += string(msg.Runes)
+		case tea.KeyBackspace:
+			runes := []rune(m.dirPath)
+			if len(runes) > 0 {
+				m.dirPath = string(runes[:len(runes)-1])
+			}
+		case tea.KeySpace:
+			m.dirPath += " "
+		case tea.KeyEsc:
+			m.state = stateDefault
+			return m, nil
+		}
+		return m, nil
+	}
+
 	// Handle confirmation state
 	if m.state == stateConfirm {
 		shouldClose := m.confirmationOverlay.HandleKeyPress(msg)
@@ -719,11 +861,33 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 
 	switch name {
 	case keys.KeyAttach:
-		if m.list.NumInstances() >= GlobalInstanceLimit {
-			return m, m.handleError(
-				fmt.Errorf("you can't create more than %d instances", GlobalInstanceLimit))
+		// Attach to existing worktree — go directly to worktree list picker
+		cwd, _ := os.Getwd()
+		if !git.IsGitRepo(cwd) {
+			return m, m.handleError(fmt.Errorf("not in a git repository — no worktrees to attach to"))
 		}
-		m.state = stateAttachMenu
+		worktrees, err := git.ListWorktrees(cwd)
+		if err != nil {
+			return m, m.handleError(fmt.Errorf("failed to list worktrees: %w", err))
+		}
+		if len(worktrees) == 0 {
+			return m, m.handleError(fmt.Errorf("no linked worktrees found — use 'n' then 'w' to create a new one"))
+		}
+		items := make([]overlay.SelectionItem, len(worktrees))
+		for i, wt := range worktrees {
+			items[i] = overlay.SelectionItem{
+				Label:       wt.Branch,
+				Description: wt.Path,
+				Value:       wt.Path,
+			}
+		}
+		m.selectionOverlay = overlay.NewSelectionOverlay(
+			"Attach to Existing Worktree",
+			items,
+			"↑/↓ navigate • enter select • p type path • esc cancel",
+		)
+		m.selectionOverlay.SetWidth(55)
+		m.state = stateAttachList
 		return m, nil
 	case keys.KeyHelp:
 		return m.showHelpScreen(helpTypeGeneral{}, nil)
@@ -753,20 +917,7 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 			return m, m.handleError(
 				fmt.Errorf("you can't create more than %d instances", GlobalInstanceLimit))
 		}
-		instance, err := session.NewInstance(session.InstanceOptions{
-			Title:   "",
-			Path:    ".",
-			Program: m.program,
-		})
-		if err != nil {
-			return m, m.handleError(err)
-		}
-
-		m.newInstanceFinalizer = m.list.AddInstance(instance)
-		m.list.SetSelectedInstance(m.list.NumInstances() - 1)
-		m.state = stateNew
-		m.menu.SetState(ui.StateNewInstance)
-
+		m.state = stateNewMenu
 		return m, nil
 	case keys.KeyUp:
 		m.list.Up()
@@ -879,6 +1030,17 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		}
 		return m, tea.WindowSize()
 	case keys.KeyEnter:
+		// Pipeline tab: jump to matched instance
+		if m.tabbedWindow.IsInPipelineTab() {
+			item := m.tabbedWindow.GetPipelineJumpTarget()
+			if item != nil && item.InstanceIdx >= 0 {
+				m.list.SetSelectedInstance(item.InstanceIdx)
+				m.tabbedWindow.SetActiveTab(ui.PreviewTab)
+				m.menu.SetActiveTab(ui.PreviewTab)
+				return m, m.instanceChanged()
+			}
+			return m, nil
+		}
 		if m.list.NumInstances() == 0 {
 			return m, nil
 		}
@@ -980,6 +1142,15 @@ type instanceStartedMsg struct {
 	promptAfterName bool
 }
 
+// pipelineTickMsg triggers a pipeline data refresh.
+type pipelineTickMsg struct{}
+
+// pipelineUpdateDoneMsg carries refreshed pipeline data back to the main loop.
+type pipelineUpdateDoneMsg struct {
+	items []pipeline.Item
+	err   error
+}
+
 // tickUpdateMetadataCmd returns a self-chaining Cmd that sleeps 500ms, then performs
 // expensive metadata I/O (tmux capture, git diff) in parallel background goroutines.
 // Because it only re-schedules after completing, overlapping ticks are impossible.
@@ -1013,6 +1184,14 @@ func tickUpdateMetadataCmd(instances []*session.Instance) tea.Cmd {
 		wg.Wait()
 
 		return metadataUpdateDoneMsg{results: results}
+	}
+}
+
+// pipelineTick returns a Cmd that sleeps 5 seconds then triggers a pipeline refresh.
+func pipelineTick() tea.Cmd {
+	return func() tea.Msg {
+		time.Sleep(5 * time.Second)
+		return pipelineTickMsg{}
 	}
 }
 
@@ -1083,9 +1262,14 @@ func (m *home) View() string {
 			log.ErrorLog.Printf("confirmation overlay is nil")
 		}
 		return overlay.PlaceOverlay(0, 0, m.confirmationOverlay.Render(), mainView, true, true)
-	} else if m.state == stateAttachMenu {
-		attachOverlay := m.renderAttachMenuOverlay()
-		return overlay.PlaceOverlay(0, 0, attachOverlay, mainView, true, true)
+	} else if m.state == stateNewMenu {
+		newMenuOverlay := m.renderNewMenuOverlay()
+		return overlay.PlaceOverlay(0, 0, newMenuOverlay, mainView, true, true)
+	} else if m.state == stateRepoSelect {
+		if m.selectionOverlay == nil {
+			log.ErrorLog.Printf("selection overlay is nil")
+		}
+		return overlay.PlaceOverlay(0, 0, m.selectionOverlay.Render(), mainView, true, true)
 	} else if m.state == stateAttachList {
 		if m.selectionOverlay == nil {
 			log.ErrorLog.Printf("selection overlay is nil")
@@ -1094,13 +1278,16 @@ func (m *home) View() string {
 	} else if m.state == stateAttachPath {
 		pathOverlay := m.renderAttachPathOverlay()
 		return overlay.PlaceOverlay(0, 0, pathOverlay, mainView, true, true)
+	} else if m.state == stateDirPath {
+		dirOverlay := m.renderDirPathOverlay()
+		return overlay.PlaceOverlay(0, 0, dirOverlay, mainView, true, true)
 	}
 
 	return mainView
 }
 
-// renderAttachMenuOverlay renders the attach mode selector overlay.
-func (m *home) renderAttachMenuOverlay() string {
+// renderNewMenuOverlay renders the new-instance mode selector overlay (n key submenu).
+func (m *home) renderNewMenuOverlay() string {
 	style := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("62")).
@@ -1115,13 +1302,87 @@ func (m *home) renderAttachMenuOverlay() string {
 	branchHint := fmt.Sprintf("(branch: %s{name})", cfg.BranchPrefix)
 
 	content := lipgloss.JoinVertical(lipgloss.Left,
-		lipgloss.NewStyle().Bold(true).Underline(true).Foreground(lipgloss.Color("#7D56F4")).Render("Create New Instance"),
+		lipgloss.NewStyle().Bold(true).Underline(true).Foreground(lipgloss.Color("#7D56F4")).Render("New Instance"),
 		"",
 		highlightKey.Render("w")+"   New worktree "+dimStyle.Render(branchHint),
-		highlightKey.Render("e")+"   Existing worktree (pick from list)",
-		highlightKey.Render("n")+"   No worktree (run in current directory)",
+		highlightKey.Render("n")+"   No worktree (current directory)",
+		highlightKey.Render("d")+"   No worktree (different directory)",
 		"",
 		dimStyle.Render("esc to cancel"),
+	)
+	return style.Render(content)
+}
+
+// discoverRepos finds known git repositories from existing CS instances and the cwd.
+func (m *home) discoverRepos() []overlay.SelectionItem {
+	seen := make(map[string]bool)
+	var items []overlay.SelectionItem
+
+	// 1. Current working directory (if it's a git repo)
+	cwd, _ := os.Getwd()
+	if git.IsGitRepo(cwd) {
+		if root, err := git.FindGitRepoRoot(cwd); err == nil && !seen[root] {
+			seen[root] = true
+			items = append(items, overlay.SelectionItem{
+				Label:       filepath.Base(root),
+				Description: root,
+				Value:       root,
+			})
+		}
+	}
+
+	// 2. Repos from existing CS instances (via their stored worktree repo paths)
+	for _, inst := range m.list.GetInstances() {
+		wt := inst.GetWorktreePath()
+		if wt == "" {
+			continue
+		}
+		// Try to resolve the repo root from the stored path
+		if root, err := git.FindGitRepoRoot(wt); err == nil && !seen[root] {
+			seen[root] = true
+			items = append(items, overlay.SelectionItem{
+				Label:       filepath.Base(root),
+				Description: root,
+				Value:       root,
+			})
+		}
+	}
+
+	// 3. Also check instance.Path for WorktreeNone instances that might point to a repo
+	for _, inst := range m.list.GetInstances() {
+		if inst.Path != "" && git.IsGitRepo(inst.Path) {
+			if root, err := git.FindGitRepoRoot(inst.Path); err == nil && !seen[root] {
+				seen[root] = true
+				items = append(items, overlay.SelectionItem{
+					Label:       filepath.Base(root),
+					Description: root,
+					Value:       root,
+				})
+			}
+		}
+	}
+
+	return items
+}
+
+// renderDirPathOverlay renders the directory path entry overlay for no-worktree different-dir mode.
+func (m *home) renderDirPathOverlay() string {
+	style := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("62")).
+		Padding(1, 2).
+		Width(60)
+
+	pathDisplay := m.dirPath
+	if pathDisplay == "" {
+		pathDisplay = lipgloss.NewStyle().Foreground(lipgloss.Color("#777777")).Render("(type path to directory)")
+	}
+	content := lipgloss.JoinVertical(lipgloss.Left,
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#7D56F4")).Render("Enter directory path:"),
+		"",
+		pathDisplay+"█",
+		"",
+		lipgloss.NewStyle().Foreground(lipgloss.Color("#777777")).Render("enter to confirm, esc to cancel"),
 	)
 	return style.Render(content)
 }
