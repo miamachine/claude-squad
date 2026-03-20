@@ -36,6 +36,9 @@ type Config struct {
 	DaemonPollInterval int `json:"daemon_poll_interval"`
 	// BranchPrefix is the prefix used for git branches created by the application.
 	BranchPrefix string `json:"branch_prefix"`
+	// DisableDiffStats skips periodic `git add -N . && git diff` computation.
+	// Set to true for very large repositories where this is expensive.
+	DisableDiffStats bool `json:"disable_diff_stats"`
 }
 
 // DefaultConfig returns the default configuration

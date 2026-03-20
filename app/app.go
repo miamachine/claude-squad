@@ -99,6 +99,9 @@ type home struct {
 	menu *ui.Menu
 	// tabbedWindow displays the tabbed window with preview and diff panes
 	tabbedWindow *ui.TabbedWindow
+	// lastDiffCost tracks how long the most recent diff computation took,
+	// used for adaptive throttling of expensive git operations.
+	lastDiffCost time.Duration
 	// errBox displays error messages
 	errBox *ui.ErrBox
 	// global spinner instance. we plumb this down to where it's needed
@@ -223,7 +226,10 @@ func (m *home) Init() tea.Cmd {
 			time.Sleep(100 * time.Millisecond)
 			return previewTickMsg{}
 		},
-		tickUpdateMetadataCmd(m.list.GetInstances()),
+		tickUpdateMetadataCmd(m.list.GetInstances(), diffPolicy{
+			disabled:  m.appConfig.DisableDiffStats,
+			tabActive: m.tabbedWindow.IsInDiffTab(),
+		}),
 		pipelineTick(),
 	)
 }
@@ -245,6 +251,9 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.menu.ClearKeydown()
 		return m, nil
 	case metadataUpdateDoneMsg:
+		if msg.diffDuration > 0 {
+			m.lastDiffCost = msg.diffDuration
+		}
 		for _, r := range msg.results {
 			if r.updated {
 				r.instance.SetStatus(session.Running)
@@ -262,7 +271,11 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				r.instance.SetDiffStats(r.diffStats)
 			}
 		}
-		return m, tickUpdateMetadataCmd(m.list.GetInstances())
+		return m, tickUpdateMetadataCmd(m.list.GetInstances(), diffPolicy{
+			disabled:  m.appConfig.DisableDiffStats,
+			tabActive: m.tabbedWindow.IsInDiffTab(),
+			lastCost:  m.lastDiffCost,
+		})
 	case pipelineTickMsg:
 		instances := m.list.GetInstances()
 		agentDir := m.agentDir
@@ -1197,7 +1210,15 @@ type instanceMetaResult struct {
 
 // metadataUpdateDoneMsg is sent when the background metadata update completes.
 type metadataUpdateDoneMsg struct {
-	results []instanceMetaResult
+	results      []instanceMetaResult
+	diffDuration time.Duration // how long the diff step took (0 if skipped)
+}
+
+// diffPolicy controls when and how often git diff is computed.
+type diffPolicy struct {
+	disabled   bool          // hard kill switch from config
+	tabActive  bool          // whether the diff tab is currently visible
+	lastCost   time.Duration // how long the previous diff computation took
 }
 
 type instanceStartedMsg struct {
@@ -1215,12 +1236,30 @@ type pipelineUpdateDoneMsg struct {
 	err   error
 }
 
-// tickUpdateMetadataCmd returns a self-chaining Cmd that sleeps 500ms, then performs
+// tickUpdateMetadataCmd returns a self-chaining Cmd that sleeps then performs
 // expensive metadata I/O (tmux capture, git diff) in parallel background goroutines.
 // Because it only re-schedules after completing, overlapping ticks are impossible.
-func tickUpdateMetadataCmd(instances []*session.Instance) tea.Cmd {
+//
+// Diff computation is adaptive:
+//   - Skipped entirely when disabled via config or when the diff tab is not visible
+//   - When the diff tab IS visible, the sleep interval scales with the measured cost
+//     of the previous diff (minimum 500ms, or 3x the last diff duration — whichever
+//     is greater). This prevents thrashing on large repos where git add -N takes seconds.
+func tickUpdateMetadataCmd(instances []*session.Instance, dp diffPolicy) tea.Cmd {
 	return func() tea.Msg {
-		time.Sleep(500 * time.Millisecond)
+		// Adaptive sleep: base 500ms, but if diff was expensive, back off
+		sleep := 500 * time.Millisecond
+		if dp.lastCost > 0 {
+			adaptiveSleep := dp.lastCost * 3
+			if adaptiveSleep > sleep {
+				sleep = adaptiveSleep
+			}
+			// Cap at 30 seconds so the UI never feels completely frozen
+			if sleep > 30*time.Second {
+				sleep = 30 * time.Second
+			}
+		}
+		time.Sleep(sleep)
 
 		var active []*session.Instance
 		for _, inst := range instances {
@@ -1232,8 +1271,11 @@ func tickUpdateMetadataCmd(instances []*session.Instance) tea.Cmd {
 			return metadataUpdateDoneMsg{}
 		}
 
+		runDiff := !dp.disabled && dp.tabActive
+
 		results := make([]instanceMetaResult, len(active))
 		var wg sync.WaitGroup
+		diffStart := time.Now()
 		for idx, inst := range active {
 			wg.Add(1)
 			go func(i int, instance *session.Instance) {
@@ -1242,12 +1284,19 @@ func tickUpdateMetadataCmd(instances []*session.Instance) tea.Cmd {
 				r.instance = instance
 				r.instance.CheckAndHandleTrustPrompt()
 				r.updated, r.hasPrompt = instance.HasUpdated()
-				r.diffStats = instance.ComputeDiff()
+				if runDiff {
+					r.diffStats = instance.ComputeDiff()
+				}
 			}(idx, inst)
 		}
 		wg.Wait()
 
-		return metadataUpdateDoneMsg{results: results}
+		var diffDur time.Duration
+		if runDiff {
+			diffDur = time.Since(diffStart)
+		}
+
+		return metadataUpdateDoneMsg{results: results, diffDuration: diffDur}
 	}
 }
 

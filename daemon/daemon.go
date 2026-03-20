@@ -38,6 +38,11 @@ func RunDaemon(cfg *config.Config) error {
 	// If we get an error for a session, it's likely that we'll keep getting the error. Log every 30 seconds.
 	everyN := log.NewEvery(60 * time.Second)
 
+	// Adaptive diff throttling: track how long the last diff took and back off
+	// proportionally so we don't hammer the CPU on large repos.
+	var lastDiffCost time.Duration
+	var nextDiffAfter time.Time
+
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
 	stopCh := make(chan struct{})
@@ -45,18 +50,40 @@ func RunDaemon(cfg *config.Config) error {
 		defer wg.Done()
 		ticker := time.NewTimer(pollInterval)
 		for {
+			now := time.Now()
+			runDiff := !cfg.DisableDiffStats && now.After(nextDiffAfter)
+
 			for _, instance := range instances {
 				// We only store started instances, but check anyway.
 				if instance.Started() && !instance.Paused() {
 					if _, hasPrompt := instance.HasUpdated(); hasPrompt {
 						instance.TapEnter()
-						if err := instance.UpdateDiffStats(); err != nil {
-							if everyN.ShouldLog() {
-								log.WarningLog.Printf("could not update diff stats for %s: %v", instance.Title, err)
+						if runDiff {
+							diffStart := time.Now()
+							if err := instance.UpdateDiffStats(); err != nil {
+								if everyN.ShouldLog() {
+									log.WarningLog.Printf("could not update diff stats for %s: %v", instance.Title, err)
+								}
+							}
+							cost := time.Since(diffStart)
+							if cost > lastDiffCost {
+								lastDiffCost = cost
 							}
 						}
 					}
 				}
+			}
+
+			// Schedule next diff: wait at least 3x the cost, capped at 30s
+			if runDiff && lastDiffCost > 0 {
+				backoff := lastDiffCost * 3
+				if backoff > 30*time.Second {
+					backoff = 30 * time.Second
+				}
+				if backoff < pollInterval {
+					backoff = pollInterval
+				}
+				nextDiffAfter = time.Now().Add(backoff)
 			}
 
 			// Handle stop before ticker.

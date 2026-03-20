@@ -144,8 +144,8 @@ func (m *Menu) addInstanceOptions() {
 		actionGroup = append(actionGroup, keys.KeyCheckout)
 	}
 
-	// Navigation group (when in diff tab)
-	if m.activeTab == DiffTab || m.activeTab == TerminalTab {
+	// Navigation group (when in diff, terminal, or pipeline tab)
+	if m.activeTab == DiffTab || m.activeTab == TerminalTab || m.activeTab == PipelineTab {
 		actionGroup = append(actionGroup, keys.KeyShiftUp)
 	}
 

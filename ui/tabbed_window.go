@@ -2,6 +2,7 @@ package ui
 
 import (
 	"claude-squad/log"
+	"claude-squad/pipeline"
 	"claude-squad/session"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -34,6 +35,7 @@ const (
 	PreviewTab int = iota
 	DiffTab
 	TerminalTab
+	PipelineTab
 )
 
 type Tab struct {
@@ -53,19 +55,22 @@ type TabbedWindow struct {
 	preview  *PreviewPane
 	diff     *DiffPane
 	terminal *TerminalPane
+	pipeline *PipelinePane
 	instance *session.Instance
 }
 
-func NewTabbedWindow(preview *PreviewPane, diff *DiffPane, terminal *TerminalPane) *TabbedWindow {
+func NewTabbedWindow(preview *PreviewPane, diff *DiffPane, terminal *TerminalPane, pipelinePane *PipelinePane) *TabbedWindow {
 	return &TabbedWindow{
 		tabs: []string{
 			"Preview",
 			"Diff",
 			"Terminal",
+			"Pipeline",
 		},
 		preview:  preview,
 		diff:     diff,
 		terminal: terminal,
+		pipeline: pipelinePane,
 	}
 }
 
@@ -93,6 +98,7 @@ func (w *TabbedWindow) SetSize(width, height int) {
 	w.preview.SetSize(contentWidth, contentHeight)
 	w.diff.SetSize(contentWidth, contentHeight)
 	w.terminal.SetSize(contentWidth, contentHeight)
+	w.pipeline.SetSize(contentWidth, contentHeight)
 }
 
 func (w *TabbedWindow) GetPreviewSize() (width, height int) {
@@ -145,6 +151,8 @@ func (w *TabbedWindow) ScrollUp() {
 		if err := w.terminal.ScrollUp(); err != nil {
 			log.InfoLog.Printf("tabbed window failed to scroll terminal up: %v", err)
 		}
+	case PipelineTab:
+		w.pipeline.CursorUp()
 	}
 }
 
@@ -161,6 +169,8 @@ func (w *TabbedWindow) ScrollDown() {
 		if err := w.terminal.ScrollDown(); err != nil {
 			log.InfoLog.Printf("tabbed window failed to scroll terminal down: %v", err)
 		}
+	case PipelineTab:
+		w.pipeline.CursorDown()
 	}
 }
 
@@ -179,9 +189,31 @@ func (w *TabbedWindow) IsInTerminalTab() bool {
 	return w.activeTab == TerminalTab
 }
 
+// IsInPipelineTab returns true if the pipeline tab is currently active
+func (w *TabbedWindow) IsInPipelineTab() bool {
+	return w.activeTab == PipelineTab
+}
+
 // GetActiveTab returns the currently active tab index
 func (w *TabbedWindow) GetActiveTab() int {
 	return w.activeTab
+}
+
+// SetActiveTab sets the active tab to the given index.
+func (w *TabbedWindow) SetActiveTab(tab int) {
+	if tab >= 0 && tab < len(w.tabs) {
+		w.activeTab = tab
+	}
+}
+
+// UpdatePipelineData updates the pipeline pane with new items.
+func (w *TabbedWindow) UpdatePipelineData(items []pipeline.Item) {
+	w.pipeline.SetItems(items)
+}
+
+// GetPipelineJumpTarget returns the currently selected pipeline item for jumping.
+func (w *TabbedWindow) GetPipelineJumpTarget() *pipeline.Item {
+	return w.pipeline.GetSelectedItem()
 }
 
 // AttachTerminal attaches to the terminal tmux session
@@ -263,6 +295,8 @@ func (w *TabbedWindow) String() string {
 		content = w.diff.String()
 	case TerminalTab:
 		content = w.terminal.String()
+	case PipelineTab:
+		content = w.pipeline.String()
 	}
 	window := windowStyle.Render(
 		lipgloss.Place(
